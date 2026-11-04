@@ -12,6 +12,10 @@ SPLUNK_SERVER="172.20.240.20"
 SPLUNK_PORT="9997"
 PACKAGE="$1"
 
+echo "=========================================="
+echo " CCDC Splunk Universal Forwarder Installer"
+echo "=========================================="
+
 # Require root
 if [[ $EUID -ne 0 ]]; then
     echo "Run as root: sudo bash install-splunk-uf.sh package"
@@ -25,7 +29,14 @@ if [[ -z "$PACKAGE" || ! -f "$PACKAGE" ]]; then
     exit 1
 fi
 
-# Detect package manager
+# Prevent accidental reinstall
+if [[ -d "$SPLUNK_HOME" ]]; then
+    echo "A Splunk Forwarder installation already exists."
+    echo "Stopping to avoid overwriting its configuration."
+    exit 1
+fi
+
+# Detect package manager and validate package
 if command -v apt-get >/dev/null 2>&1; then
     echo "[+] Debian/Ubuntu detected"
 
@@ -34,13 +45,17 @@ if command -v apt-get >/dev/null 2>&1; then
         exit 1
     fi
 
+    PACKAGE_TYPE="deb"
+
 elif command -v dnf >/dev/null 2>&1; then
-    echo "[+] Rocky Linux detected"
+    echo "[+] Rocky/RHEL detected"
 
     if [[ "$PACKAGE" != *.rpm ]]; then
         echo "Expected an .rpm package"
         exit 1
     fi
+
+    PACKAGE_TYPE="rpm"
 
 else
     echo "Unsupported operating system"
@@ -58,10 +73,10 @@ id splunkfwd >/dev/null 2>&1 || \
 # Install Splunk
 echo "[+] Installing Universal Forwarder..."
 
-if [[ "$PACKAGE" == *.deb ]]; then
-    dpkg -i "$PACKAGE"
+if [[ "$PACKAGE_TYPE" == "deb" ]]; then
+    apt-get install -y "./$PACKAGE"
 else
-    rpm -i "$PACKAGE"
+    dnf install -y "./$PACKAGE"
 fi
 
 # Set ownership
@@ -116,16 +131,19 @@ EOF
     fi
 done
 
-# Set ownership again after configuration
+# Set ownership after configuration
 chown -R splunkfwd:splunkfwd "$SPLUNK_HOME"
 
 # Start Splunk as dedicated user
 echo "[+] Starting Splunk..."
 
 runuser -u splunkfwd -- \
-    "$SPLUNK_HOME/bin/splunk" start --accept-license
+    "$SPLUNK_HOME/bin/splunk" start \
+    --accept-license \
+    --answer-yes \
+    --no-prompt
 
-# Enable boot startup under dedicated user
+# Enable boot startup
 echo "[+] Enabling boot startup..."
 
 "$SPLUNK_HOME/bin/splunk" enable boot-start \
@@ -133,13 +151,33 @@ echo "[+] Enabling boot startup..."
     -group splunkfwd \
     -systemd-managed 1
 
+# Restart service
 echo "[+] Restarting Splunk..."
 
 systemctl restart SplunkForwarder
 
+# Check service
+echo "[+] Checking service status..."
+
+systemctl status SplunkForwarder --no-pager
+
+# Check forwarding configuration
 echo "[+] Checking forwarding configuration..."
 
 runuser -u splunkfwd -- \
     "$SPLUNK_HOME/bin/splunk" list forward-server
 
-echo "[+] Installation complete!"
+# Test network connectivity
+echo "[+] Testing connection to central Splunk server..."
+
+if command -v nc >/dev/null 2>&1; then
+    nc -zvw5 "$SPLUNK_SERVER" "$SPLUNK_PORT"
+else
+    echo "Netcat not installed. Skipping connectivity test."
+fi
+
+echo ""
+echo "=========================================="
+echo " Installation completed!"
+echo " Forwarding to: ${SPLUNK_SERVER}:${SPLUNK_PORT}"
+echo "=========================================="
