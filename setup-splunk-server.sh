@@ -1,225 +1,126 @@
+    sys.exit("ERROR: New passwords do not match or are empty.")
 
-#!/bin/bash
-
-# CCDC Splunk Enterprise Server Setup
-# Debian 12 / Splunk Enterprise 10.0.2
-# Server: 172.20.240.20
-# run script: sudo bash setup-splunk-server.sh
-
-# CHECK SYSTEM UPDATES
-echo "Checking for system updates..."
-
-apt-get update
-
-echo "Available package upgrades:"
-apt list --upgradable
-
-# Ask before upgrading
-read -r -p "Upgrade system packages? [y/N]: " UPDATE
-
-if [[ "$UPDATE" =~ ^[Yy]$ ]]; then
-    apt-get upgrade -y
-    echo "[+] System packages updated."
-else
-    echo "[+] Package upgrades skipped."
-fi
-
-
-# CONFIGURE SPLUNK FIREWALL
-echo "=================================="
-echo " CCDC Splunk Firewall Setup"
-echo "=================================="
-
-# Check for UFW
-if ! command -v ufw >/dev/null 2>&1; then
-    echo "UFW is not installed."
-    echo "Install with: sudo apt install ufw"
-    exit 1
-fi
-
-# Show existing services and rules
-echo "[+] Currently listening ports:"
-ss -lntup
-
-echo "[+] Current firewall rules:"
-ufw status verbose
-
-# Back up existing firewall configuration
-BACKUP="/root/ufw-backup-$(date +%Y%m%d-%H%M%S)"
-
-cp -a /etc/ufw "$BACKUP"
-echo "[+] Firewall backup saved to $BACKUP"
-
-# Ask before resetting
-echo ""
-echo "This will replace existing UFW rules."
-echo "Allowed incoming ports: 22, 8000, 8089, 9997"
-echo "Other incoming connections will be denied."
-echo "Outgoing connections will be allowed."
-echo ""
-
-read -r -p "Type RESET to continue: " CONFIRM
-
-if [[ "$CONFIRM" != "RESET" ]]; then
-    echo "Firewall changes skipped."
-else
-    # Reset existing UFW rules
-    ufw --force reset
-
-    # Allow SSH first
-    ufw allow 22/tcp comment 'CCDC SSH'
-
-    # Allow Splunk services
-    ufw allow 8000/tcp comment 'Splunk Web'
-    ufw allow 8089/tcp comment 'Splunk Management'
-    ufw allow 9997/tcp comment 'Splunk Forwarders'
-
-    # Default firewall policies
-    ufw default deny incoming
-    ufw default allow outgoing
-
-    # Enable logging
-    ufw logging low
-
-    # Enable firewall
-    ufw --force enable
-
-    echo "[+] Firewall configured."
-    echo "[+] Rules are persistent across reboots."
-
-    # Verify configuration
-    ufw status verbose
-fi
-
-set -euo pipefail
-
-SPLUNK_HOME="/opt/splunk"
-SPLUNK_BIN="$SPLUNK_HOME/bin/splunk"
-INPUTS="$SPLUNK_HOME/etc/system/local/inputs.conf"
-RECEIVER_PORT="9997"
-
-echo "=================================="
-echo " CCDC Splunk Server Setup"
-echo "=================================="
-
-# Check root privileges
-if [[ $EUID -ne 0 ]]; then
-    echo "Run using sudo."
-    exit 1
-fi
-
-# Check installation
-if [[ ! -x "$SPLUNK_BIN" ]]; then
-    echo "ERROR: Splunk Enterprise not found."
-    exit 1
-fi
-
-# Check Python (used for secure password prompt)
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "ERROR: Python 3 is required."
-    exit 1
-fi
-
-# Step 1: Change admin password
-echo "[1/4] Changing Splunk admin password..."
-
-python3 - <<'PY'
-import base64
-import getpass
-import ssl
-import sys
-import urllib.error
-import urllib.parse
-import urllib.request
-
-old_password = getpass.getpass("Current admin password: ")
-new_password = getpass.getpass("New admin password: ")
-confirm = getpass.getpass("Confirm new password: ")
-
-if not new_password or new_password != confirm:
-    sys.exit("ERROR: Passwords do not match or are empty.")
-
-credentials = base64.b64encode(
-    f"admin:{old_password}".encode()
-).decode()
-
+credentials = base64.b64encode(("admin:" + old_password).encode()).decode()
 data = urllib.parse.urlencode({
     "password": new_password,
-    "oldpassword": old_password
+    "oldpassword": old_password,
 }).encode()
-
 request = urllib.request.Request(
     "https://127.0.0.1:8089/services/authentication/users/admin",
     data=data,
-    headers={
-        "Authorization": f"Basic {credentials}"
-    },
-    method="POST"
+    headers={"Authorization": "Basic " + credentials},
+    method="POST",
 )
-
-# Localhost only; Splunk commonly uses a self-signed certificate
+# Only connects to this VM's loopback interface. Splunk may use a self-signed cert.
 context = ssl._create_unverified_context()
-
 try:
-    with urllib.request.urlopen(
-        request, context=context, timeout=15
-    ) as response:
+    with urllib.request.urlopen(request, context=context, timeout=15) as response:
         response.read()
-except urllib.error.HTTPError as error:
-    sys.exit(f"Password change failed: HTTP {error.code}")
-except urllib.error.URLError as error:
-    sys.exit(f"Cannot reach Splunk management API: {error.reason}")
-
-print("[+] Admin password changed successfully.")
+except urllib.error.HTTPError as exc:
+    sys.exit(f"ERROR: Password change failed (HTTP {exc.code}).")
+except urllib.error.URLError as exc:
+    sys.exit(f"ERROR: Cannot reach local Splunk API: {exc.reason}")
+print("[+] Admin password updated.")
 PY
+fi
 
-# Step 2: Back up configuration
-echo "[2/4] Checking receiving configuration..."
-
+echo ""
+echo "=== Configure receiving port 9997 ==="
 mkdir -p "$(dirname "$INPUTS")"
-
 if [[ -f "$INPUTS" ]]; then
     cp -p "$INPUTS" "${INPUTS}.bak.$(date +%Y%m%d-%H%M%S)"
 fi
 
-# Add receiving port without overwriting existing inputs
-if [[ -f "$INPUTS" ]] &&
-   grep -Eq '^\[splunktcp://(:)?9997\][[:space:]]*$' "$INPUTS"; then
-    echo "[!] Receiver stanza already exists."
-    echo "[!] Verify it is enabled before proceeding."
+# Preserve other inputs.conf stanzas; enable an existing receiver if disabled.
+python3 - "$INPUTS" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines() if path.exists() else []
+receiver = re.compile(r"^\[splunktcp://:?9997\]$")
+starts = [i for i, line in enumerate(lines) if receiver.fullmatch(line.strip())]
+if not starts:
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines += ["[splunktcp://9997]", "disabled = 0"]
+    print("[+] Added TCP receiver 9997.")
+else:
+    # Work backwards to avoid shifting indices when adding a setting.
+    for start in reversed(starts):
+        end = next((i for i in range(start + 1, len(lines))
+                    if re.match(r"^\s*\[", lines[i])), len(lines))
+        disabled = [i for i in range(start + 1, end)
+                    if re.match(r"^\s*disabled\s*=", lines[i])]
+        if disabled:
+            for i in disabled:
+                lines[i] = "disabled = 0"
+        else:
+            lines.insert(start + 1, "disabled = 0")
+    print("[+] Existing TCP receiver 9997 enabled.")
+path.write_text("\n".join(lines) + "\n")
+PY
+
+echo ""
+echo "=== Configure UFW firewall ==="
+if ! command -v ufw >/dev/null 2>&1; then
+    echo "WARNING: UFW is not installed; skipping firewall setup."
+    echo "After reviewing current rules, you may install it: sudo apt-get install ufw"
 else
-    cat >> "$INPUTS" <<EOF
-
-[splunktcp://${RECEIVER_PORT}]
-disabled = 0
-EOF
-
-    echo "[+] Receiver configured on TCP $RECEIVER_PORT"
+    ufw status verbose
+    echo ""
+    echo "Optional RESET will remove existing UFW rules."
+    echo "New incoming allows: TCP 22, 8000, 8089, 9997."
+    echo "Default: deny other incoming; allow outgoing."
+    echo "Only reset after checking any additional scored services."
+    if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}" ]]; then
+        echo "WARNING: SSH session detected. Firewall reset skipped. Use NETLAB+ console."
+    else
+        read -r -p "Type RESET to replace UFW rules, or Enter to skip: " CONFIRM
+        if [[ "$CONFIRM" == "RESET" ]]; then
+            BACKUP="/root/ufw-backup-$(date +%Y%m%d-%H%M%S)"
+            cp -a /etc/ufw "$BACKUP"
+            echo "[+] Saved UFW backup: $BACKUP"
+            ufw --force reset
+            ufw default deny incoming
+            ufw default allow outgoing
+            ufw allow 22/tcp comment 'CCDC SSH'
+            ufw allow 8000/tcp comment 'Splunk Web'
+            ufw allow 8089/tcp comment 'Splunk Management'
+            ufw allow 9997/tcp comment 'Splunk Receiver'
+            ufw logging low
+            ufw --force enable
+            echo "[+] New firewall rules (persistent):"
+            ufw status verbose
+        else
+            echo "[+] Existing UFW rules unchanged."
+        fi
+    fi
 fi
 
-# Step 3: Restart Splunk
-echo "[3/4] Restart required to apply receiver settings."
-
-read -r -p "Restart Splunk now? [y/N]: " RESTART
-
+echo ""
+echo "=== Apply Splunk configuration ==="
+read -r -p "Restart Splunk now? This briefly interrupts scoring. [y/N]: " RESTART
 if [[ "$RESTART" =~ ^[Yy]$ ]]; then
-    "$SPLUNK_BIN" restart
+    if systemctl cat Splunkd.service >/dev/null 2>&1; then
+        systemctl restart Splunkd.service
+    elif systemctl cat splunkd.service >/dev/null 2>&1; then
+        systemctl restart splunkd.service
+    else
+        echo "WARNING: No standard Splunk systemd service found."
+        echo "Restart Splunk using its existing service manager and OS account."
+    fi
 else
-    echo "[!] Restart Splunk using its existing service manager."
+    echo "[!] Restart deferred. Receiver change may not be active yet."
 fi
 
-# Step 4: Verify ports
-echo "[4/4] Checking listening ports..."
-
-ss -lnt | grep -E ':(8000|8089|9997)[[:space:]]' || true
-
 echo ""
-echo "=================================="
-echo " Setup finished"
-echo "=================================="
-echo "Splunk Web:        Port 8000"
-echo "Splunk Management: Port 8089"
-echo "Forwarder Receiver: Port 9997"
+echo "=== Verify ==="
+"$SPLUNK_BIN" status || true
+"$SPLUNK_BIN" cmd btool inputs list | grep -EA 3 '^\[splunktcp://:?9997\]' || true
+ss -lntp | grep -E ':(22|8000|8089|9997)[[:space:]]' || true
+df -h "$SPLUNK_HOME"
 echo ""
-echo "Verify that TCP 9997 is listening"
-echo "after Splunk has restarted."
+echo "Check that 9997 is listening and forwarder events arrive in Splunk."
+echo "Do not assume that an open port means scoring is working."
