@@ -92,8 +92,3 @@ Write-Host "============================================"
     Write-Host " Forwarding to: $SplunkServer"
     Write-Host "============================================"
 }
-finally {
-    $SplunkPassword = $null
-    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
-    $SecurePassword.Dispose()
-}
