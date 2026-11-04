@@ -82,8 +82,6 @@ Copy the following files onto the Linux machine:
 
 For example, place them in a folder called `CCDC-Splunk`.
 
-You can use a USB drive, shared folder, or another method available in the competition environment.
-
 ### Step 2: Open a terminal
 
 Open a terminal on the Linux machine.
