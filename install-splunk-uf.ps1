@@ -32,18 +32,6 @@ Write-Host "============================================"
 Write-Host " CCDC Splunk Forwarder Installation"
 Write-Host "============================================"
 
-# Get Splunk administrator password
-$SecurePassword = Read-Host "Enter Splunk forwarder admin password" -AsSecureString
-
-$BSTR = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePassword)
-
-try {
-    $SplunkPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($BSTR)
-
-    if ([string]::IsNullOrWhiteSpace($SplunkPassword)) {
-        throw "Password cannot be empty."
-    }
-
     # Download installer
     Write-Host "[1/5] Downloading Splunk Universal Forwarder..."
 
