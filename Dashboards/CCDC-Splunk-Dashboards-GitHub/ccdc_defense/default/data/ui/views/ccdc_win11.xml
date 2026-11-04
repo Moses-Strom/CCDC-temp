@@ -1,0 +1,73 @@
+<?xml version='1.0' encoding='utf-8'?>
+<form version="1.1">
+  <label>CCDC | Windows 11 Workstation</label>
+  <description>DHCP workstation. Select its real host from the dropdown.</description>
+  <fieldset submitButton="false" autoRun="true">
+    <input type="dropdown" token="selected_host" searchWhenChanged="true">
+      <label>Select indexed hostname for this VM</label>
+      <choice value="*">All hosts (choose your VM)</choice>
+      <search>
+        <query>index=* earliest=-24h | stats count by host | fields host | sort host</query>
+      </search>
+      <fieldForLabel>host</fieldForLabel>
+      <fieldForValue>host</fieldForValue>
+      <default>*</default>
+      <initialValue>*</initialValue>
+    </input>
+    <input type="time" token="time" searchWhenChanged="true">
+      <label>Time range</label>
+      <default>
+        <earliest>-1h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+  </fieldset>
+  <row>
+    <panel>
+      <title>Windows Logins</title>
+      <table>
+        <search>
+          <query>index=* host="$selected_host$" EventCode=4624 | stats count by host,Account_Name,Logon_Type,Source_Network_Address | sort -count</query>
+          <earliest>$time.earliest$</earliest>
+          <latest>$time.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Failed Logons</title>
+      <table>
+        <search>
+          <query>index=* host="$selected_host$" EventCode=4625 | stats count by host,Account_Name,Source_Network_Address | sort -count</query>
+          <earliest>$time.earliest$</earliest>
+          <latest>$time.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Service Installation</title>
+      <table>
+        <search>
+          <query>index=* host="$selected_host$" EventCode=7045 | table _time host Service_Name Service_File_Name Message | sort -_time</query>
+          <earliest>$time.earliest$</earliest>
+          <latest>$time.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Task Creation and Log Clearing</title>
+      <table>
+        <search>
+          <query>index=* host="$selected_host$" (EventCode=4698 OR EventCode=1102 OR EventCode=104) | table _time host EventCode Message | sort -_time</query>
+          <earliest>$time.earliest$</earliest>
+          <latest>$time.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+</form>

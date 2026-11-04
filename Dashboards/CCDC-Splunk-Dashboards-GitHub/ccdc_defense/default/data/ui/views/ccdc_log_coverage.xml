@@ -1,0 +1,50 @@
+<?xml version='1.0' encoding='utf-8'?>
+<form version="1.1">
+  <label>CCDC | Log Coverage</label>
+  <description>Check what you receive before assuming a detection works.</description>
+  <fieldset submitButton="false" autoRun="true">
+    <input type="time" token="time" searchWhenChanged="true">
+      <label>Time range</label>
+      <default>
+        <earliest>-1h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+  </fieldset>
+  <row>
+    <panel>
+      <title>All Ingest by Host and Source</title>
+      <table>
+        <search>
+          <query>index=* | stats count latest(_time) as last_seen by host,source,sourcetype | convert ctime(last_seen) | sort host</query>
+          <earliest>$time.earliest$</earliest>
+          <latest>$time.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Windows Audit Events Available</title>
+      <table>
+        <search>
+          <query>index=* (EventCode=4624 OR EventCode=4625 OR EventCode=4698 OR EventCode=7045 OR EventCode=4769 OR EventCode=5136 OR EventCode=5145 OR EventCode=1102) | stats count by EventCode,host | sort EventCode</query>
+          <earliest>$time.earliest$</earliest>
+          <latest>$time.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Internal Splunk Warnings</title>
+      <table>
+        <search>
+          <query>index=_internal (log_level=WARN OR log_level=ERROR) | stats count by component,log_level | sort -count</query>
+          <earliest>$time.earliest$</earliest>
+          <latest>$time.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+</form>

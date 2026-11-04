@@ -1,0 +1,75 @@
+<?xml version='1.0' encoding='utf-8'?>
+<form version="1.1">
+  <label>CCDC | Overall Monitoring</label>
+  <description>Monitor all available CCDC telemetry. Panels show only what has actually been indexed.</description>
+  <fieldset submitButton="false" autoRun="true">
+    <input type="time" token="time" searchWhenChanged="true">
+      <label>Time range</label>
+      <default>
+        <earliest>-1h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+  </fieldset>
+  <row>
+    <panel>
+      <title>Host and Log Source Coverage</title>
+      <table>
+        <search>
+          <query>index=* | stats count dc(sourcetype) as sourcetypes latest(_time) as last_seen by host | convert ctime(last_seen) | sort host</query>
+          <earliest>$time.earliest$</earliest>
+          <latest>$time.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Event Volume by Host</title>
+      <chart>
+        <search>
+          <query>index=* | timechart span=5m count by host limit=12</query>
+          <earliest>$time.earliest$</earliest>
+          <latest>$time.latest$</latest>
+        </search>
+        <option name="charting.chart">column</option>
+      </chart>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Recent Windows Account and System Changes</title>
+      <table>
+        <search>
+          <query>index=* (EventCode=4720 OR EventCode=4722 OR EventCode=4724 OR EventCode=4725 OR EventCode=4728 OR EventCode=4732 OR EventCode=4741 OR EventCode=4697 OR EventCode=7045 OR EventCode=1102 OR EventCode=104) | table _time host EventCode Account_Name Message | sort -_time | head 100</query>
+          <earliest>$time.earliest$</earliest>
+          <latest>$time.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Linux Authentication Failures</title>
+      <table>
+        <search>
+          <query>index=* ("Failed password" OR "Invalid user") | stats count by host,source | sort -count</query>
+          <earliest>$time.earliest$</earliest>
+          <latest>$time.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Firewall Logging Coverage</title>
+      <table>
+        <search>
+          <query>index=* (sourcetype=pan* OR sourcetype=ccdc:pan_syslog OR sourcetype=ccdc:vyos_syslog) | stats count latest(_time) as last_seen by host,sourcetype | convert ctime(last_seen)</query>
+          <earliest>$time.earliest$</earliest>
+          <latest>$time.latest$</latest>
+        </search>
+      </table>
+    </panel>
+  </row>
+</form>

@@ -1,0 +1,15 @@
+<?xml version='1.0' encoding='utf-8'?>
+<nav search_view="search">
+  <view name="ccdc_overview" default="true" />
+  <view name="ccdc_log_coverage" />
+  <view name="ccdc_detection_triage" />
+  <view name="ccdc_ad" />
+  <view name="ccdc_mssql" />
+  <view name="ccdc_win11" />
+  <view name="ccdc_rocky" />
+  <view name="ccdc_email" />
+  <view name="ccdc_splunk" />
+  <view name="ccdc_ubuntu_workstation" />
+  <view name="ccdc_palo_alto" />
+  <view name="ccdc_vyos" />
+</nav>
