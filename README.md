@@ -1,200 +1,296 @@
-# Splunk Universal Forwarder Installation Guide
+# CCDC Splunk Universal Forwarder Installation Guide
 
-This guide explains how to install and configure the Splunk Universal Forwarder on Linux (`*nix`) and Windows machines.
+This guide explains how to install and configure the Splunk Universal Forwarder on Windows and Linux machines during CCDC.
 
-The scripts automatically configure the Universal Forwarder to send logs to the central Splunk server.
+The installation scripts configure each machine to forward logs to the central Splunk Enterprise server.
+
+**Supported operating systems:**
+- Windows Server 2019 / 2022
+- Windows 11
+- Debian / Ubuntu
+- Rocky Linux / RHEL
+
+**Splunk Universal Forwarder version:** `10.0.2`
+
+> **Important:** These scripts are intended for fresh installations. They have not yet been fully verified on every competition VM. Test them in NETLAB+ before relying on them during a scored competition.
+
+---
 
 ## 1. Before You Start
 
-### What you need
+### Requirements
 
-- Access to the machine you want to install the forwarder on.
-- Administrator/root privileges.
-- The appropriate Universal Forwarder installer.
-- The installation script for your operating system.
+- Access to the machine you are configuring.
+- Administrator privileges (Windows) or root/sudo privileges (Linux).
+- The correct installation script.
 - Network connectivity to the central Splunk server.
+- The appropriate Linux installer package (`.deb` or `.rpm`) if installing on Linux.
 
-### Central Splunk server information
+### Central Splunk Server
 
 | Setting | Value |
 |---|---|
-| Splunk server IP | `172.20.240.20` |
+| Server | Debian Splunk Enterprise |
+| IP address | `172.20.240.20` |
 | Receiving port | `9997` |
-| Universal Forwarder version | `10.0.2` |
+| Splunk version | `10.0.2` |
+| Forwarding protocol | TCP |
 
-**Important:** The Splunk server must have receiving enabled on TCP port `9997` before forwarders can send it data.
+**Important:** The central Splunk server must have receiving enabled on TCP port `9997` before machines can forward logs to it.
+
+On the central Splunk server, check the configured receiving ports:
+
+```bash
+sudo /opt/splunk/bin/splunk list listen
+```
+
+If receiving is not enabled, an authorized Splunk administrator can enable it:
+
+```bash
+sudo /opt/splunk/bin/splunk enable listen 9997 -auth admin
+```
+
+Enter the central Splunk administrator password if prompted.
+
+This command is for the **central Splunk server**, not the Universal Forwarder machines.
+
+Make sure host firewalls and network rules permit the required TCP traffic.
 
 ---
 
 ## 2. Download the Installers
 
-Download the installer that matches the operating system of the machine you are configuring.
+The Linux and Windows installation scripts handle installers differently.
 
-| Operating system | Installer |
-|---|---|
-| Debian / Ubuntu | `.deb` |
-| Rocky Linux / RHEL | `.rpm` |
-| Windows 64-bit | `.msi` |
+| Operating system | Installer | Download required beforehand? |
+|---|---|---|
+| Debian / Ubuntu | `.deb` | Yes |
+| Rocky Linux / RHEL | `.rpm` | Yes |
+| Windows Server / Windows 11 | `.msi` | No, script downloads automatically |
 
-Download packages:
+### Installer download links
 
-[Windows](https://download.splunk.com/products/universalforwarder/releases/10.0.2/windows/splunkforwarder-10.0.2-e2d18b4767e9-windows-x64.msi)
+**Windows 64-bit:**
 
-[Debian / Ubuntu](https://download.splunk.com/products/universalforwarder/releases/10.0.2/linux/splunkforwarder-10.0.2-e2d18b4767e9-linux-amd64.deb)
+https://download.splunk.com/products/universalforwarder/releases/10.0.2/windows/splunkforwarder-10.0.2-e2d18b4767e9-windows-x64.msi
 
-[Rocky Linux](https://download.splunk.com/products/universalforwarder/releases/10.0.2/linux/splunkforwarder-10.0.2-e2d18b4767e9.x86_64.rpm?utm_source=chatgpt.com)
+**Debian / Ubuntu 64-bit:**
 
-Select version **10.0.2** and the correct operating system.
+https://download.splunk.com/products/universalforwarder/releases/10.0.2/linux/splunkforwarder-10.0.2-e2d18b4767e9-linux-amd64.deb
+
+**Rocky Linux / RHEL 64-bit:**
+
+https://download.splunk.com/products/universalforwarder/releases/10.0.2/linux/splunkforwarder-10.0.2-e2d18b4767e9.x86_64.rpm
+
+If a direct link fails, find the appropriate installer on the [official Splunk Universal Forwarder download page](https://www.splunk.com/en_us/download/universal-forwarder.html).
+
+Do not rename a downloaded HTML page or error response to `.deb`, `.rpm`, or `.msi`. Make sure the file is an actual installer.
 
 ### Recommended folder structure
-
-Keep the installers and scripts organized in one folder:
 
 ```text
 CCDC-Splunk/
 │
 ├── Installers/
-│   ├── splunkforwarder-linux-amd64.deb
-│   ├── splunkforwarder-linux-x64.rpm
-│   └── splunkforwarder-windows-x64.msi
+│   ├── splunkforwarder-10.0.2-e2d18b4767e9-linux-amd64.deb
+│   └── splunkforwarder-10.0.2-e2d18b4767e9.x86_64.rpm
 │
 └── Scripts/
     ├── install-splunk-uf.sh
     └── install-splunk-uf.ps1
 ```
 
-The filenames above are examples. If your downloaded files have different names, use their actual filenames when following the instructions.
+The Windows installer does not need to be included because the PowerShell script downloads it automatically.
 
-**You do not need all three installers on every machine.** Only use the installer that matches the operating system.
+**Note:** You only need the Linux installer that matches the machine's operating system.
 
 ---
 
-# 3. Linux Installation (`*nix`)
+## 3. Linux Installation (`*nix`)
 
-Use these instructions for Debian, Ubuntu, Rocky Linux, and other supported Linux distributions.
+Use these instructions for Debian, Ubuntu, Rocky Linux, and RHEL.
 
-### Step 1: Get the files onto the Linux machine
+### Step 1: Get the files onto the machine
 
-Copy the following files onto the Linux machine:
+Copy the `CCDC-Splunk` folder, or the required files from it, onto the Linux machine.
+
+You need:
 
 - `install-splunk-uf.sh`
-- The appropriate Linux installer (`.deb` or `.rpm`)
+- The appropriate `.deb` or `.rpm` installer package.
 
-For example, place them in a folder called `CCDC-Splunk`.
+You can transfer the files using a supported shared folder, removable storage, or another method available in your competition environment.
 
 ### Step 2: Open a terminal
 
 Open a terminal on the Linux machine.
 
-Navigate to the folder containing the files.
-
-For example:
+Navigate to your `CCDC-Splunk` folder:
 
 ```bash
 cd ~/CCDC-Splunk
 ```
 
-If you placed the files somewhere else, navigate to that location instead.
+This example assumes the folder is inside your home directory. Use the actual location if it differs.
 
-### Step 3: Make the script executable
-
-Run:
+Check that the files exist:
 
 ```bash
-chmod +x install-splunk-uf.sh
+ls Scripts/
+ls Installers/
 ```
 
-This gives the script permission to run.
+You should see the installation script and the appropriate package.
 
-### Step 4: Run the script
+### Step 3: Run the installation script
 
-**For Debian / Ubuntu:**
+Choose the command for your operating system.
+
+**Debian / Ubuntu:**
 
 ```bash
-sudo ./install-splunk-uf.sh ./splunkforwarder-linux-amd64.deb
+sudo bash Scripts/install-splunk-uf.sh Installers/splunkforwarder-10.0.2-e2d18b4767e9-linux-amd64.deb
 ```
 
-**For Rocky Linux / RHEL:**
+**Rocky Linux / RHEL:**
 
 ```bash
-sudo ./install-splunk-uf.sh ./splunkforwarder-linux-x64.rpm
+sudo bash Scripts/install-splunk-uf.sh Installers/splunkforwarder-10.0.2-e2d18b4767e9.x86_64.rpm
 ```
 
-Replace the installer filename with the actual name of your downloaded package if it differs.
+Replace the installer filename if yours differs.
 
-### Step 5: Follow the prompts
+The script must run with root privileges because it installs software, creates a service account, and configures the Universal Forwarder.
 
-The script will handle the installation and configuration.
+You do not need to run `chmod +x` when executing the script with `bash`.
 
-Depending on the script version, it will:
+### Step 4: What the script does
 
-1. Check for the required privileges.
-2. Create the `splunkfwd` user and group.
-3. Install the Universal Forwarder.
-4. Set the appropriate file ownership.
-5. Configure the forwarding destination.
-6. Configure selected log files for collection.
-7. Start the Universal Forwarder.
-8. Configure it to start automatically when the machine boots.
+The script automatically attempts to:
 
-If the script asks for credentials, enter the credentials requested by the script.
+1. Check for root privileges.
+2. Verify that the installer package exists.
+3. Detect Debian/Ubuntu or Rocky/RHEL.
+4. Check whether a Universal Forwarder installation already exists.
+5. Create the `splunkfwd` Linux user and group.
+6. Install the Universal Forwarder.
+7. Assign ownership of the forwarder directory to `splunkfwd`.
+8. Configure forwarding to `172.20.240.20:9997`.
+9. Configure collection of supported Linux log files.
+10. Start the Universal Forwarder.
+11. Configure it to start automatically when the machine boots.
+12. Check the forwarder and connection.
 
-### Step 6: Verify the installation
+The script does not ask you to create a local Splunk admin password.
 
-Check whether the Universal Forwarder service is running:
+**Note:** First-time initialization and service startup must be tested on the actual competition Linux images. If the script fails, record the error instead of assuming installation completed.
+
+### Step 5: Verify the service
+
+Check whether the forwarder is running:
 
 ```bash
 sudo systemctl status SplunkForwarder
 ```
 
-You can also check the forwarding configuration:
+The expected status is:
+
+```text
+Active: active (running)
+```
+
+If the service is not running, investigate the error.
+
+View recent forwarder logs:
+
+```bash
+sudo tail -n 50 /opt/splunkforwarder/var/log/splunk/splunkd.log
+```
+
+### Step 6: Verify the forwarding configuration
+
+Run:
 
 ```bash
 sudo cat /opt/splunkforwarder/etc/system/local/outputs.conf
 ```
 
-You should see the central Splunk server configured as the forwarding destination:
+You should see:
 
 ```ini
 [tcpout]
-defaultGroup = default-autolb-group
+defaultGroup = ccdc_indexer
 
-[tcpout:default-autolb-group]
+[tcpout:ccdc_indexer]
 server = 172.20.240.20:9997
 ```
 
-**If the service is running and the destination is correct, the Linux installation is configured.**
+This confirms that the destination is configured correctly.
+
+It does not guarantee that logs have been delivered successfully.
+
+### Step 7: Verify log collection
+
+Check the configured inputs:
+
+```bash
+sudo cat /opt/splunkforwarder/etc/system/local/inputs.conf
+```
+
+Depending on the operating system and installed services, the script may configure:
+
+- `/var/log/syslog`
+- `/var/log/messages`
+- `/var/log/auth.log`
+- `/var/log/secure`
+- `/var/log/audit/audit.log`
+- `/var/log/audit.log`
+- `/var/log/cron`
+- `/var/log/maillog`
+- `/var/log/mail.log`
+- Apache access and error logs.
+
+Only log files present when the script runs are added.
+
+**Important:** The `splunkfwd` user might not have permission to read protected logs, particularly authentication and audit logs.
+
+If the forwarder is running but certain logs are missing in Splunk, check log file permissions and the forwarder's internal logs. Avoid making sensitive logs publicly readable.
 
 ---
 
-# 4. Windows Installation
+## 4. Windows Installation
 
-Use these instructions for Windows Server and Windows workstation machines.
+Use these instructions for:
 
-### Step 1: Get the files onto the Windows machine
+- Windows Server 2019
+- Windows Server 2022
+- Windows 11
 
-Copy the following files onto the Windows machine:
+### Step 1: Get the script onto the Windows machine
 
-- `install-splunk-uf.ps1`
-- The Windows Universal Forwarder installer (`.msi`), if your script is configured to use a local installer.
+Copy `install-splunk-uf.ps1` onto the Windows machine.
 
-Place them in a folder such as:
+For example:
 
 ```text
-C:\CCDC-Splunk\
+C:\CCDC-Splunk\Scripts\install-splunk-uf.ps1
 ```
 
-**Note:** The previously provided PowerShell script downloads the Windows MSI automatically. If you are using that version, you do not need to manually place the MSI in the folder. The machine will need access to the download site. If internet access is unavailable, the script must be adjusted to use the locally downloaded MSI instead.
+You do not need to download the Windows MSI beforehand.
+
+The script automatically downloads Splunk Universal Forwarder 10.0.2 from the configured Splunk download URL.
+
+**Important:** The machine must have network access to the download server.
 
 ### Step 2: Open PowerShell as Administrator
 
-1. Open the Windows Start menu.
+1. Open the Start menu.
 2. Search for `PowerShell`.
-3. Right-click Windows PowerShell.
+3. Right-click **Windows PowerShell**.
 4. Select **Run as administrator**.
-5. Approve the User Account Control prompt.
+5. Approve the administrator prompt.
 
-Administrator privileges are required to install and configure the service.
+Administrator privileges are required to install the forwarder and configure its service.
 
 ### Step 3: Navigate to the script folder
 
@@ -204,56 +300,70 @@ Run:
 cd C:\CCDC-Splunk
 ```
 
-If you saved the script somewhere else, navigate to that folder instead.
+If the folder is stored somewhere else, navigate to its actual location.
 
 ### Step 4: Allow the script to run
 
-If PowerShell prevents the script from running, enter:
+If PowerShell prevents the script from running because of its execution policy, enter:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 ```
 
-If prompted, confirm the change.
+Confirm if prompted.
 
-This only changes the execution policy for the current PowerShell session.
+This sets the execution policy for the current PowerShell session only.
+
+Only use this for scripts your team has reviewed and trusts.
 
 ### Step 5: Run the installation script
 
-Run:
-
 ```powershell
-.\install-splunk-uf.ps1
+.\Scripts\install-splunk-uf.ps1
 ```
 
-### Step 6: Follow the prompts
+The script does not require command-line arguments or a separate local Splunk admin password.
 
-The script will:
+### Step 6: What the script does
 
-1. Check that PowerShell is running as Administrator.
-2. Download the Universal Forwarder installer if using the download-based version.
-3. Prompt you for the Splunk administrator password.
-4. Install the Universal Forwarder.
-5. Configure it to forward data to `172.20.240.20:9997`.
-6. Enable Windows Security, System, and Application event log collection.
-7. Start the Universal Forwarder service.
-8. Configure the service to start automatically.
+The script automatically attempts to:
 
-Enter the password requested by the script when prompted.
+1. Check for Windows administrator privileges.
+2. Check whether the Universal Forwarder is already installed.
+3. Download the Windows Universal Forwarder MSI.
+4. Install Splunk Universal Forwarder 10.0.2.
+5. Configure forwarding to `172.20.240.20:9997`.
+6. Enable Security, System, and Application event log collection.
+7. Configure the Windows service to start automatically.
+8. Start the service if necessary.
+9. Test TCP connectivity to the central Splunk server.
+10. Display the service status.
 
-**Important:** Use the Splunk credentials requested by the script, not the Windows administrator password.
+The script configures the forwarder to run using the Windows Local System account.
 
-### Step 7: Verify the installation
+It does not prompt for separate Splunk administrator credentials.
 
-Check whether the Universal Forwarder service is running:
+### Step 7: Verify the service
+
+In PowerShell, run:
 
 ```powershell
 Get-Service SplunkForwarder
 ```
 
-You should see the service with a status of `Running`.
+Look for:
 
-Next, test connectivity to the central Splunk server:
+```text
+Status   Name
+------   ----
+Running  SplunkForwarder
+```
+
+If the service is not running, check the installation output and Windows event logs.
+
+### Step 8: Test connectivity
+
+Run:
 
 ```powershell
 Test-NetConnection 172.20.240.20 -Port 9997
@@ -265,26 +375,278 @@ Look for:
 TcpTestSucceeded : True
 ```
 
-This confirms that the machine can establish a TCP connection to the Splunk receiving port.
+This confirms the Windows machine can establish a TCP connection to the central Splunk server.
+
+It does not guarantee that events are being indexed.
+
+If the test fails, check the network connection, firewall rules, and receiving port on the central server.
 
 ---
 
-# 5. Verify Data in Splunk
+## 5. Verify Data in Splunk
 
-After installing the forwarder, log in to the central Splunk Enterprise web interface.
+This step is required for both Linux and Windows.
 
-1. Open a browser.
-2. Navigate to the Splunk web interface.
-3. Log in.
-4. Open **Search & Reporting**.
-5. Run the following search:
+A successful installation does not necessarily mean logs are being collected or received.
 
-```spl
-index=* | stats count by host, source, sourcetype
+### Step 1: Open Splunk
+
+Open a browser and navigate to the central Splunk Enterprise web interface:
+
+```text
+http://172.20.240.20:8000
 ```
 
-This displays the hosts and log sources that have sent data to Splunk.
+This assumes Splunk Web is enabled and using its default HTTP port. Use the configured URL or HTTPS address if your server differs.
 
-You can also search for a specific machine:
+Log in with the central Splunk server credentials.
+
+### Step 2: Open Search & Reporting
+
+Navigate to the Search & Reporting app.
+
+### Step 3: Search for incoming logs
+
+Run:
 
 ```spl
+index=* earliest=-15m | stats count by host, sourcetype
+```
+
+This displays machines and log types that have sent events during the last 15 minutes.
+
+### Step 4: Find your specific machine
+
+Run:
+
+```spl
+index=* earliest=-15m host="MACHINE-NAME"
+```
+
+Replace `MACHINE-NAME` with the hostname of the machine you configured.
+
+To find the hostname:
+
+**Windows:**
+
+```powershell
+hostname
+```
+
+**Linux:**
+
+```bash
+hostname
+```
+
+If the hostname appears with recent events, the forwarder is successfully sending at least some data.
+
+### Step 5: Check the log types
+
+For Windows, look for event logs such as:
+
+- Security
+- System
+- Application
+
+For Linux, look for the available log files configured by the installation script.
+
+If you only see some sources, investigate the missing inputs and their permissions.
+
+---
+
+## 6. Troubleshooting
+
+| Problem | Possible cause / solution |
+|---|---|
+| Linux says the package cannot be found | Check the filename and path in `Installers/`. |
+| Linux reports an unsupported operating system | The distribution is not handled by the current script. |
+| Linux package installation fails | Check the error message and package dependencies. |
+| Linux service fails to start | Check `systemctl status` and `splunkd.log`. |
+| Linux logs are missing | Check file permissions for the `splunkfwd` user. |
+| Windows PowerShell blocks the script | Check execution policy and whether you trust the script. |
+| Windows download fails | Check internet access and the MSI download URL. |
+| Windows installation fails | Check administrator privileges and the MSI exit code. |
+| Forwarder already installed | The script intentionally stops to avoid overwriting an installation. |
+| TCP port 9997 is unreachable | Check receiving settings, network connectivity, and firewall rules. |
+| Service running but no logs in Splunk | Check forwarding, log inputs, permissions, and the central server. |
+
+### Useful Linux commands
+
+Check service:
+
+```bash
+sudo systemctl status SplunkForwarder
+```
+
+Restart service:
+
+```bash
+sudo systemctl restart SplunkForwarder
+```
+
+View recent forwarder logs:
+
+```bash
+sudo tail -n 50 /opt/splunkforwarder/var/log/splunk/splunkd.log
+```
+
+Check forwarding destination:
+
+```bash
+sudo cat /opt/splunkforwarder/etc/system/local/outputs.conf
+```
+
+Check configured log inputs:
+
+```bash
+sudo cat /opt/splunkforwarder/etc/system/local/inputs.conf
+```
+
+### Useful Windows commands
+
+Check service:
+
+```powershell
+Get-Service SplunkForwarder
+```
+
+Restart service:
+
+```powershell
+Restart-Service SplunkForwarder
+```
+
+Test connectivity:
+
+```powershell
+Test-NetConnection 172.20.240.20 -Port 9997
+```
+
+View recent forwarder logs:
+
+```powershell
+Get-Content "C:\Program Files\SplunkUniversalForwarder\var\log\splunk\splunkd.log" -Tail 50
+```
+
+---
+
+## 7. Important Competition Notes
+
+### Existing installations
+
+These scripts are designed for fresh installations.
+
+If a Universal Forwarder installation already exists, the scripts are configured to stop rather than overwrite it.
+
+If an installation fails partway through, investigate the failure before rerunning the script.
+
+### Do not install on the central Splunk server
+
+The Debian Splunk Enterprise machine at `172.20.240.20` is the central receiver.
+
+You generally do not need to install a separate Universal Forwarder on that machine.
+
+Splunk Enterprise can collect its own local logs when configured to do so.
+
+### Internet access
+
+The Windows script downloads its installer automatically.
+
+If internet access is unavailable in the competition environment, the Windows script must be modified to use a locally stored MSI.
+
+The Linux script already uses a local `.deb` or `.rpm` package.
+
+### Account permissions
+
+The Linux forwarder runs as `splunkfwd`.
+
+The Windows forwarder is configured to run as Local System.
+
+These identities must have access to the logs they are configured to collect.
+
+For competition testing, verify collection before making additional permission changes.
+
+### Network configuration
+
+All forwarders are configured to send logs to:
+
+```text
+172.20.240.20:9997
+```
+
+Do not change competition network addressing, firewall configuration, or required services without understanding the competition rules and dependencies.
+
+---
+
+## 8. Installation Checklist
+
+Complete this checklist for each machine.
+
+- [ ] Correct installation script selected.
+- [ ] Linux installer downloaded and copied to the machine, if applicable.
+- [ ] Script executed with administrator/root privileges.
+- [ ] Installation completed without errors.
+- [ ] Splunk Universal Forwarder service is running.
+- [ ] Service is configured to start automatically.
+- [ ] Forwarding destination is `172.20.240.20:9997`.
+- [ ] TCP connectivity to the central server works.
+- [ ] Machine appears in Splunk Search & Reporting.
+- [ ] Expected log sources are being collected.
+- [ ] Forwarder continues running after a reboot.
+
+**Installation is only considered verified when the machine successfully sends the expected logs to the central Splunk server.**
+
+---
+
+## 9. Quick Command Reference
+
+### Linux
+
+**Debian / Ubuntu:**
+
+```bash
+sudo bash Scripts/install-splunk-uf.sh Installers/splunkforwarder-10.0.2-e2d18b4767e9-linux-amd64.deb
+```
+
+**Rocky Linux / RHEL:**
+
+```bash
+sudo bash Scripts/install-splunk-uf.sh Installers/splunkforwarder-10.0.2-e2d18b4767e9.x86_64.rpm
+```
+
+**Check service:**
+
+```bash
+sudo systemctl status SplunkForwarder
+```
+
+### Windows
+
+**Run PowerShell as Administrator:**
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\Scripts\install-splunk-uf.ps1
+```
+
+**Check service:**
+
+```powershell
+Get-Service SplunkForwarder
+```
+
+**Test connection:**
+
+```powershell
+Test-NetConnection 172.20.240.20 -Port 9997
+```
+
+### Central Splunk server
+
+**Verify incoming data:**
+
+```spl
+index=* earliest=-15m | stats count by host, sourcetype
+```
+
