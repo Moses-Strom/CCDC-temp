@@ -36,7 +36,7 @@ Download the installer that matches the operating system of the machine you are 
 | Rocky Linux / RHEL | `.rpm` |
 | Windows 64-bit | `.msi` |
 
-Use the official Splunk download page:
+Download packages:
 
 [Windows](https://download.splunk.com/products/universalforwarder/releases/10.0.2/windows/splunkforwarder-10.0.2-e2d18b4767e9-windows-x64.msi)
 
