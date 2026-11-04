@@ -4,6 +4,7 @@
 # CCDC Splunk Enterprise Server Setup
 # Debian 12 / Splunk Enterprise 10.0.2
 # Server: 172.20.240.20
+# sudo bash setup-splunk-server.sh
 
 set -euo pipefail
 
