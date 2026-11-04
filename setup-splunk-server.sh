@@ -1,3 +1,67 @@
+#!/usr/bin/env bash
+# CCDC Splunk Enterprise Server Setup
+# Debian 12 / Splunk Enterprise 10.0.2
+# Intended VM: 172.20.240.20
+# Run from NETLAB+ console: sudo bash setup-splunk-server.sh
+
+set -euo pipefail
+umask 022
+
+SPLUNK_HOME="/opt/splunk"
+SPLUNK_BIN="$SPLUNK_HOME/bin/splunk"
+INPUTS="$SPLUNK_HOME/etc/system/local/inputs.conf"
+
+# Check permissions and dependencies BEFORE changing anything.
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: Run with sudo."
+    exit 1
+fi
+if [[ ! -x "$SPLUNK_BIN" ]]; then
+    echo "ERROR: Splunk not found at $SPLUNK_BIN"
+    exit 1
+fi
+for cmd in python3 ss; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "ERROR: Required command not found: $cmd"
+        exit 1
+    fi
+done
+
+echo "=== CCDC Splunk Server Setup ==="
+echo "Existing listening ports:"
+ss -lntup
+
+echo ""
+read -r -p "Check for Debian package updates? [y/N]: " CHECK_UPDATES
+if [[ "$CHECK_UPDATES" =~ ^[Yy]$ ]]; then
+    if apt-get update; then
+        apt list --upgradable 2>/dev/null || true
+        read -r -p "Install available upgrades? May disrupt services. [y/N]: " UPGRADE
+        if [[ "$UPGRADE" =~ ^[Yy]$ ]]; then
+            apt-get upgrade -y
+        fi
+    else
+        echo "WARNING: Package list update failed. Continuing without upgrades."
+    fi
+fi
+
+echo ""
+echo "=== Change Splunk admin password ==="
+read -r -p "Change Splunk admin password? [y/N]: " CHANGE_PASSWORD
+if [[ "$CHANGE_PASSWORD" =~ ^[Yy]$ ]]; then
+    python3 - <<'PY'
+import base64
+import getpass
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+old_password = getpass.getpass("Current Splunk admin password: ")
+new_password = getpass.getpass("New Splunk admin password: ")
+confirm = getpass.getpass("Confirm new password: ")
+if not new_password or new_password != confirm:
     sys.exit("ERROR: New passwords do not match or are empty.")
 
 credentials = base64.b64encode(("admin:" + old_password).encode()).decode()
@@ -61,66 +125,3 @@ else:
     print("[+] Existing TCP receiver 9997 enabled.")
 path.write_text("\n".join(lines) + "\n")
 PY
-
-echo ""
-echo "=== Configure UFW firewall ==="
-if ! command -v ufw >/dev/null 2>&1; then
-    echo "WARNING: UFW is not installed; skipping firewall setup."
-    echo "After reviewing current rules, you may install it: sudo apt-get install ufw"
-else
-    ufw status verbose
-    echo ""
-    echo "Optional RESET will remove existing UFW rules."
-    echo "New incoming allows: TCP 22, 8000, 8089, 9997."
-    echo "Default: deny other incoming; allow outgoing."
-    echo "Only reset after checking any additional scored services."
-    if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}" ]]; then
-        echo "WARNING: SSH session detected. Firewall reset skipped. Use NETLAB+ console."
-    else
-        read -r -p "Type RESET to replace UFW rules, or Enter to skip: " CONFIRM
-        if [[ "$CONFIRM" == "RESET" ]]; then
-            BACKUP="/root/ufw-backup-$(date +%Y%m%d-%H%M%S)"
-            cp -a /etc/ufw "$BACKUP"
-            echo "[+] Saved UFW backup: $BACKUP"
-            ufw --force reset
-            ufw default deny incoming
-            ufw default allow outgoing
-            ufw allow 22/tcp comment 'CCDC SSH'
-            ufw allow 8000/tcp comment 'Splunk Web'
-            ufw allow 8089/tcp comment 'Splunk Management'
-            ufw allow 9997/tcp comment 'Splunk Receiver'
-            ufw logging low
-            ufw --force enable
-            echo "[+] New firewall rules (persistent):"
-            ufw status verbose
-        else
-            echo "[+] Existing UFW rules unchanged."
-        fi
-    fi
-fi
-
-echo ""
-echo "=== Apply Splunk configuration ==="
-read -r -p "Restart Splunk now? This briefly interrupts scoring. [y/N]: " RESTART
-if [[ "$RESTART" =~ ^[Yy]$ ]]; then
-    if systemctl cat Splunkd.service >/dev/null 2>&1; then
-        systemctl restart Splunkd.service
-    elif systemctl cat splunkd.service >/dev/null 2>&1; then
-        systemctl restart splunkd.service
-    else
-        echo "WARNING: No standard Splunk systemd service found."
-        echo "Restart Splunk using its existing service manager and OS account."
-    fi
-else
-    echo "[!] Restart deferred. Receiver change may not be active yet."
-fi
-
-echo ""
-echo "=== Verify ==="
-"$SPLUNK_BIN" status || true
-"$SPLUNK_BIN" cmd btool inputs list | grep -EA 3 '^\[splunktcp://:?9997\]' || true
-ss -lntp | grep -E ':(22|8000|8089|9997)[[:space:]]' || true
-df -h "$SPLUNK_HOME"
-echo ""
-echo "Check that 9997 is listening and forwarder events arrive in Splunk."
-echo "Do not assume that an open port means scoring is working."
