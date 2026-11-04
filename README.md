@@ -38,7 +38,11 @@ Download the installer that matches the operating system of the machine you are 
 
 Use the official Splunk download page:
 
-https://www.splunk.com/en_us/download/universal-forwarder.html
+[Windows](https://download.splunk.com/products/universalforwarder/releases/10.0.2/windows/splunkforwarder-10.0.2-e2d18b4767e9-windows-x64.msi)
+
+[Debian / Ubuntu](https://download.splunk.com/products/universalforwarder/releases/10.0.2/linux/splunkforwarder-10.0.2-e2d18b4767e9-linux-amd64.deb)
+
+[Rocky Linux](https://download.splunk.com/products/universalforwarder/releases/10.0.2/linux/splunkforwarder-10.0.2-e2d18b4767e9.x86_64.rpm?utm_source=chatgpt.com)
 
 Select version **10.0.2** and the correct operating system.
 
