@@ -6,6 +6,91 @@
 # Server: 172.20.240.20
 # run script: sudo bash setup-splunk-server.sh
 
+# CHECK SYSTEM UPDATES
+echo "Checking for system updates..."
+
+apt-get update
+
+echo "Available package upgrades:"
+apt list --upgradable
+
+# Ask before upgrading
+read -r -p "Upgrade system packages? [y/N]: " UPDATE
+
+if [[ "$UPDATE" =~ ^[Yy]$ ]]; then
+    apt-get upgrade -y
+    echo "[+] System packages updated."
+else
+    echo "[+] Package upgrades skipped."
+fi
+
+
+# CONFIGURE SPLUNK FIREWALL
+echo "=================================="
+echo " CCDC Splunk Firewall Setup"
+echo "=================================="
+
+# Check for UFW
+if ! command -v ufw >/dev/null 2>&1; then
+    echo "UFW is not installed."
+    echo "Install with: sudo apt install ufw"
+    exit 1
+fi
+
+# Show existing services and rules
+echo "[+] Currently listening ports:"
+ss -lntup
+
+echo "[+] Current firewall rules:"
+ufw status verbose
+
+# Back up existing firewall configuration
+BACKUP="/root/ufw-backup-$(date +%Y%m%d-%H%M%S)"
+
+cp -a /etc/ufw "$BACKUP"
+echo "[+] Firewall backup saved to $BACKUP"
+
+# Ask before resetting
+echo ""
+echo "This will replace existing UFW rules."
+echo "Allowed incoming ports: 22, 8000, 8089, 9997"
+echo "Other incoming connections will be denied."
+echo "Outgoing connections will be allowed."
+echo ""
+
+read -r -p "Type RESET to continue: " CONFIRM
+
+if [[ "$CONFIRM" != "RESET" ]]; then
+    echo "Firewall changes skipped."
+else
+    # Reset existing UFW rules
+    ufw --force reset
+
+    # Allow SSH first
+    ufw allow 22/tcp comment 'CCDC SSH'
+
+    # Allow Splunk services
+    ufw allow 8000/tcp comment 'Splunk Web'
+    ufw allow 8089/tcp comment 'Splunk Management'
+    ufw allow 9997/tcp comment 'Splunk Forwarders'
+
+    # Default firewall policies
+    ufw default deny incoming
+    ufw default allow outgoing
+
+    # Enable logging
+    ufw logging low
+
+    # Enable firewall
+    ufw --force enable
+
+    echo "[+] Firewall configured."
+    echo "[+] Rules are persistent across reboots."
+
+    # Verify configuration
+    ufw status verbose
+fi
+
 set -euo pipefail
 
 SPLUNK_HOME="/opt/splunk"
