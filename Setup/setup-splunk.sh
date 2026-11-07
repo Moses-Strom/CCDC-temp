@@ -125,3 +125,107 @@ else:
     print("[+] Existing TCP receiver 9997 enabled.")
 path.write_text("\n".join(lines) + "\n")
 PY
+
+
+echo ""
+echo "=== Configure Splunk brute-force protection ==="
+
+AUTH_CONF="$SPLUNK_HOME/etc/system/local/authentication.conf"
+
+# Back up existing authentication configuration.
+if [[ -f "$AUTH_CONF" ]]; then
+    cp -p "$AUTH_CONF" \
+        "${AUTH_CONF}.bak.$(date +%Y%m%d-%H%M%S)"
+fi
+
+# Enable account lockouts without overwriting other settings.
+python3 - "$AUTH_CONF" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines() if path.exists() else []
+
+settings = {
+    "lockoutUsers": "true",
+    "lockoutAttempts": "5",
+    "lockoutThresholdMins": "5",
+    "lockoutMins": "30",
+}
+
+output = []
+in_section = False
+found_section = False
+seen = set()
+
+def add_missing():
+    for key, value in settings.items():
+        if key not in seen:
+            output.append(f"{key} = {value}")
+
+for line in lines:
+    match = re.match(r"^\s*\[([^\]]+)\]", line)
+
+    if match:
+        if in_section:
+            add_missing()
+        in_section = match.group(1) == "splunk_auth"
+        if in_section:
+            found_section = True
+        output.append(line)
+        continue
+
+    key_match = re.match(r"^\s*([^#;\s=]+)\s*=", line)
+
+    if in_section and key_match:
+        key = key_match.group(1)
+        if key in settings:
+            if key not in seen:
+                output.append(f"{key} = {settings[key]}")
+                seen.add(key)
+            continue
+
+    output.append(line)
+
+if in_section:
+    add_missing()
+
+if not found_section:
+    output.append("")
+    output.append("[splunk_auth]")
+    for key, value in settings.items():
+        output.append(f"{key} = {value}")
+
+path.write_text("\n".join(output) + "\n")
+PY
+
+echo "[+] Splunk brute-force protection configured."
+echo "[+] Failed login threshold: 5 attempts"
+echo "[+] Detection window: 5 minutes"
+echo "[+] Lockout duration: 30 minutes"
+echo "[+] Existing remote access settings preserved."
+
+echo ""
+echo "=== Restart Splunk ==="
+"$SPLUNK_BIN" restart
+
+echo ""
+echo "=== Verify authentication settings ==="
+"$SPLUNK_BIN" btool authentication list splunk_auth --debug \
+    | grep -E 'lockoutUsers|lockoutAttempts|lockoutThresholdMins|lockoutMins'
+
+echo ""
+echo "=== Verify Splunk listening ports ==="
+ss -lntp | grep -E ':(8000|8089|9997)\b' || true
+
+echo ""
+echo "======================================="
+echo " CCDC Splunk Server Setup Complete"
+echo "======================================="
+echo "Web GUI: http://172.20.240.20:8000"
+echo "Management API: TCP 8089"
+echo "Forwarder Receiver: TCP 9997"
+echo "Brute-force lockout policy: Enabled"
+echo ""
+echo "IMPORTANT: Verify all scored services."
