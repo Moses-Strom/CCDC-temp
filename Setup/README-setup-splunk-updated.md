@@ -52,22 +52,6 @@ Suricata passively observes traffic visible on the Debian VM's selected interfac
 
 Never commit competition passwords or secrets to the GitHub repository.
 
-## Install or update the server
-
-1. Replace the existing `Setup/setup-splunk.sh` in your repository with the **complete combined script**. Do **not** append the previous SSH/ClamAV/Suricata snippets a second time.
-2. Copy or download `setup-splunk.sh` to the Debian VM using an approved method and review it before running.
-3. From the **NETLAB VM console**, run:
-
-   ```bash
-   sudo bash setup-splunk.sh
-   ```
-
-   Or select your actual capture interface explicitly:
-
-   ```bash
-   sudo CCDC_SURICATA_IFACE=ens18 bash setup-splunk.sh
-   ```
-
 4. Answer the prompts. For **root password rotation**, the standard `passwd` utility prompts twice without printing the password. For **administrator account review**, optionally list privileged users; expiration requires a verified *new* root console login, an explicit username, and a typed `EXPIRE USERNAME` confirmation. ClamAV and Suricata remain optional.
 5. Choose whether to restart Splunk **after** installing the monitoring inputs. A restart is usually required to activate changes but can briefly affect scoring.
 6. Read the `PASS`, `FAIL`, `SKIP`, and `RESULT` lines **below `CCDC Splunk Server Setup Complete`**. The script checks local status/configuration but does not prove scoring reachability or real detection events.
