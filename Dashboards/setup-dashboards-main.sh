@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # CCDC Security Command Center - single-file offline Splunk installer
-# Run: sudo bash setup-ccdc-command-center.sh
+# Run: sudo bash setup-dashboards-main.sh
 # Auto-detects install vs update. Preserves all 12 original dashboards and five alerts.
 # Does not change service configuration, Splunk ports, inputs, or host firewall.
 set -euo pipefail
@@ -11,7 +11,7 @@ MODE="${1:-auto}"
 EXPECTED_SHA256="050913118d8d8fa322ddafad69e6567f651a009779181ed13878aa3f6d95e21d"
 
 usage() {
-  printf '%s\n' 'Usage: sudo bash setup-ccdc-command-center.sh [auto|install|--update|--verify]'
+  printf '%s\n' 'Usage: sudo bash setup-dashboards-main.sh [auto|install|--update|--verify]'
   printf '%s\n' 'Default auto mode: installs fresh or safely backs up and updates existing CCDC Defense Monitor.'
   printf '%s\n' 'Does not change firewalls, listeners, users, inputs, or start/stop Splunk.'
 }
