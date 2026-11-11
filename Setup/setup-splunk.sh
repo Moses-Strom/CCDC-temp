@@ -43,46 +43,18 @@ if [[ "$CHECK_UPDATES" =~ ^[Yy]$ ]]; then
     fi
 fi
 echo ""
-echo "=== Change Splunk admin password ==="
-read -r -p "Change Splunk admin password? [y/N]: " CHANGE_PASSWORD
-if [[ "$CHANGE_PASSWORD" =~ ^[Yy]$ ]]; then
-    python3 - <<'PY'
-import base64
-import getpass
-import ssl
-import sys
-import urllib.error
-import urllib.parse
-import urllib.request
-old_password = getpass.getpass("Current Splunk admin password: ")
-new_password = getpass.getpass("New Splunk admin password: ")
-confirm = getpass.getpass("Confirm new password: ")
-if not new_password or new_password != confirm:
-    sys.exit("ERROR: New passwords do not match or are empty.")
-credentials = base64.b64encode(("admin:" + old_password).encode()).decode()
-data = urllib.parse.urlencode({
-    "password": new_password,
-    "oldpassword": old_password,
-}).encode()
-request = urllib.request.Request(
-    "https://127.0.0.1:8089/services/authentication/users/admin",
-    data=data,
-    headers={"Authorization": "Basic " + credentials},
-    method="POST",
-)
-# Only connects to this VM's loopback interface. Splunk may use a self-signed cert.
-context = ssl._create_unverified_context()
-try:
-    with urllib.request.urlopen(request, context=context, timeout=15) as response:
-        response.read()
-except urllib.error.HTTPError as exc:
-    sys.exit(f"ERROR: Password change failed (HTTP {exc.code}).")
-except urllib.error.URLError as exc:
-    sys.exit(f"ERROR: Cannot reach local Splunk API: {exc.reason}")
-print("[+] Admin password updated.")
-PY
+echo "=== Debian root password (Splunk admin password is unchanged) ==="
+echo "This changes the Linux root password only, not the Splunk Web admin account."
+read -r -p "Change Debian root password interactively? [y/N]: " CHANGE_ROOT_PASSWORD
+if [[ "$CHANGE_ROOT_PASSWORD" =~ ^[Yy]$ ]]; then
+    # passwd prompts interactively; do not put passwords in this script or arguments.
+    if ! passwd root; then
+        echo "ERROR: Could not change the Debian root password."
+        exit 1
+    fi
+    echo "[+] Debian root password changed."
 fi
-echo ""
+
 echo "=== Configure receiving port 9997 ==="
 mkdir -p "$(dirname "$INPUTS")"
 if [[ -f "$INPUTS" ]]; then
@@ -376,6 +348,127 @@ else
     echo "[+] Skipped optional Suricata setup."
 fi
 
+# Debian privilege audit and optional ACCOUNT EXPIRATION (not password locking).
+# The Splunk admin account is separate and is not changed or expired here.
+# We list both sudo-group members and sudoers-based grants such as limited sudo.
+audit_and_optionally_expire_users() {
+    local username password_field uid gid gecos home shell groups sudo_result reason
+    local -a privileged_users=()
+    local -a findings=()
+    local active_users=""
+    local choice confirmation old_expiry
+    local sudo_supported=1
+
+    echo ""
+    echo "=== Audit local Debian privileged accounts ==="
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "WARNING: sudo is unavailable; cannot reliably audit sudoers grants."
+        sudo_supported=0
+    fi
+
+    if command -v who >/dev/null 2>&1; then
+        active_users="$(who 2>/dev/null | awk '{print $1}' | sort -u || true)"
+    fi
+
+    # Read local accounts only; usermod modifies local /etc/passwd accounts.
+    while IFS=: read -r username password_field uid gid gecos home shell; do
+        [[ "$username" == "root" ]] && continue
+        [[ "$uid" =~ ^[0-9]+$ ]] || continue
+        findings=()
+
+        if (( uid == 0 )); then
+            findings+=("UID 0 (root-equivalent)")
+        fi
+        groups="$(id -nG "$username" 2>/dev/null || true)"
+        if [[ " $groups " =~ [[:space:]](sudo|admin|wheel)[[:space:]] ]]; then
+            findings+=("administrative group")
+        fi
+
+        # sudo -l -U finds direct sudoers grants (including limited sudo) that
+        # simple group membership checks miss. Locale fixed for output parsing.
+        if (( sudo_supported )); then
+            sudo_result="$(LC_ALL=C sudo -l -U "$username" 2>&1)" || true
+            if grep -q 'may run the following commands' <<<"$sudo_result"; then
+                findings+=("sudoers permission")
+            fi
+        fi
+
+        if (( ${#findings[@]} > 0 )); then
+            privileged_users+=("$username")
+            reason="$(IFS=', '; echo "${findings[*]}")"
+            printf '[AUDIT] %-22s UID=%-6s %s\n' "$username" "$uid" "$reason"
+            if (( sudo_supported )); then
+                echo "        Inspect exact rights: sudo -l -U $username"
+            fi
+        fi
+    done < /etc/passwd
+
+    if (( ${#privileged_users[@]} == 0 )); then
+        echo "No non-root privileged accounts identified by this audit."
+        return 0
+    fi
+
+    echo ""
+    echo "Account expiration prevents new account logins after the expiry date."
+    echo "It does NOT terminate existing sessions or remove files, processes,"
+    echo "sudoers entries, SSH keys, or other persistence mechanisms."
+    echo "IMPORTANT: Verify an independent administrator login BEFORE expiring users."
+    echo "The script will not expire root or the account that invoked sudo."
+    echo "It will also skip users currently reported as logged in by 'who'."
+    if (( ! sudo_supported )); then
+        echo "WARNING: Privilege audit was incomplete; expiration is disabled."
+        return 0
+    fi
+
+    read -r -p "Review accounts for optional expiration? [y/N]: " choice
+    if [[ ! "$choice" =~ ^[Yy]$ ]]; then
+        echo "[+] Audit completed; no accounts expired."
+        return 0
+    fi
+    read -r -p "Confirm independent admin/root console access: type VERIFIED: " confirmation
+    if [[ "$confirmation" != "VERIFIED" ]]; then
+        echo "[+] Access not confirmed; no accounts expired."
+        return 0
+    fi
+
+    for username in "${privileged_users[@]}"; do
+        # Never break the account currently granting this sudo session.
+        if [[ -n "${SUDO_USER:-}" && "$username" == "$SUDO_USER" ]]; then
+            echo "[SKIP] $username: current sudo account (expire later from a separately verified root session)."
+            continue
+        fi
+        # Also avoid expiring a user who is actively logged into another session.
+        if grep -Fxq "$username" <<<"$active_users"; then
+            echo "[SKIP] $username: an active login session was detected."
+            continue
+        fi
+
+        echo ""
+        echo "Privileges for $username:"
+        LC_ALL=C sudo -l -U "$username" 2>&1 || true
+        read -r -p "Expire Debian account '$username' (YES to confirm)? " choice
+        if [[ "$choice" == "YES" ]]; then
+            # Jan 2 1970 is definitively in the past; this EXPIRES the account.
+            if usermod --expiredate 1970-01-02 "$username"; then
+                old_expiry="$(getent shadow "$username" 2>/dev/null | cut -d: -f8 || true)"
+                if [[ "$old_expiry" == "1" ]]; then
+                    echo "[+] Account $username expired; shadow expiry day = 1."
+                else
+                    echo "[!] Expiry command succeeded; verify with: chage -l $username"
+                fi
+            else
+                echo "WARNING: Unable to expire $username."
+            fi
+        else
+            echo "[SKIP] Left $username unchanged."
+        fi
+    done
+    echo ""
+    echo "Verify any account expiration with: sudo chage -l USERNAME"
+}
+
+audit_and_optionally_expire_users
+
 echo ""
 echo "======================================="
 echo " CCDC Splunk Server Setup Complete"
@@ -384,5 +477,7 @@ echo "Web GUI: http://172.20.240.20:8000"
 echo "Management API: TCP 8089"
 echo "Forwarder Receiver: TCP 9997"
 echo "Brute-force lockout policy: Enabled"
+echo "Debian account expiration: audited; any changes confirmed individually"
+echo "Splunk admin password: unchanged"
 echo ""
 echo "IMPORTANT: Verify all scored services."
