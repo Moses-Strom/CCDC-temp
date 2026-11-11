@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # CCDC | Debian 12 / Splunk Enterprise 10.0.2 server setup
 # Intended VM: 172.20.240.20 (verify in your actual CCDC pod)
-# Includes Splunk receiver/auth protection + console-only SSH restriction
+# Includes Splunk receiver/auth protection + SSH restriction + interactive Linux root
+# password rotation + optional administrator account audit/expiry
 # + ClamAV notify-only real-time scanning + passive Suricata IDS.
 # Run from NETLAB VM console: sudo bash setup-splunk.sh
 # Read-only review: sudo bash setup-splunk.sh --verify
@@ -109,23 +110,173 @@ PY_AUTH
     say 'Splunk lockout: 5 failed attempts / 5 minutes -> 30 minute lockout (effective after restart).'
 }
 
-ccdc_change_admin_password() {
-    python3 - <<'PY_PASSWORD'
-import base64, getpass, ssl, sys, urllib.error, urllib.parse, urllib.request
-old=getpass.getpass('Current Splunk admin password: ')
-new=getpass.getpass('New Splunk admin password: ')
-confirm=getpass.getpass('Confirm new password: ')
-if not new or new!=confirm: sys.exit('ERROR: Passwords do not match or are empty.')
-auth=base64.b64encode(('admin:'+old).encode()).decode()
-data=urllib.parse.urlencode({'password':new,'oldpassword':old}).encode()
-req=urllib.request.Request('https://127.0.0.1:8089/services/authentication/users/admin',data=data,headers={'Authorization':'Basic '+auth},method='POST')
-# Loopback only. The local Splunk management API may use a self-signed cert.
-try:
-    with urllib.request.urlopen(req,context=ssl._create_unverified_context(),timeout=15) as response: response.read()
-except urllib.error.HTTPError as exc: sys.exit(f'ERROR: Password update returned HTTP {exc.code}')
-except urllib.error.URLError as exc: sys.exit(f'ERROR: Local Splunk API unreachable: {exc.reason}')
-print('Splunk admin password updated.')
-PY_PASSWORD
+ccdc_change_root_password() {
+    say '=== Change Linux root password (NOT Splunk Web admin) ==='
+    say 'The system passwd utility prompts securely; no password is stored by this script.'
+    say 'This does NOT enable root SSH login (root SSH stays denied).'
+    if passwd root; then
+        say 'PASS | Linux root password change completed.'
+    else
+        warn 'Linux root password change failed; no automatic account expirations will run.'
+        return 1
+    fi
+}
+
+# Sudo permissions can come from individual sudoers entries as well as groups.
+# Audit is best-effort on local/NSS users: sudo -l -U is more precise than
+# simply listing the sudo group. Polkit and other privilege channels may exist.
+ccdc_sudo_granted() {
+    local output
+    command -v sudo >/dev/null 2>&1 || return 1
+    # Some sudo builds return exit code 0 even for "not allowed" users.
+    # Therefore inspect the English (C-locale) privilege summary itself.
+    output="$(LC_ALL=C sudo -n -l -U "$1" 2>&1 || true)"
+    grep -Eqi 'may run the following commands?' <<< "$output"
+}
+
+ccdc_is_privileged_account() {
+    local name="$1" uid
+    uid="$(id -u "$name" 2>/dev/null || true)"
+    [[ "$uid" == 0 ]] && return 0
+    ccdc_sudo_granted "$name"
+}
+
+ccdc_account_expiry() {
+    local name="$1" expiry
+    expiry="$(getent shadow "$name" 2>/dev/null | awk -F: '{print $8}' || true)"
+    if [[ "$expiry" =~ ^[0-9]+$ ]] && ((expiry > 0 && expiry <= $(date +%s)/86400)); then
+        printf 'expired'
+    elif [[ -z "$expiry" ]]; then
+        printf 'not-expired/unknown'
+    else
+        printf 'active'
+    fi
+}
+
+ccdc_audit_admins() {
+    local name uid group shell pwd_status state count=0 source
+    say ''
+    say '=== Linux local/NSS administrator privilege review (read-only) ==='
+    if ! command -v sudo >/dev/null 2>&1; then
+        warn 'sudo utility not available. Only UID 0 / sudo and wheel group hints can be reported.'
+    fi
+    printf '%-23s %-7s %-21s %-14s %s\n' 'USER' 'UID' 'SOURCE' 'EXPIRY' 'SHELL'
+    while IFS=: read -r name _ uid group _ _ shell; do
+        [[ "$uid" =~ ^[0-9]+$ ]] || continue
+        if [[ "$uid" == 0 ]]; then
+            source='UID0/root'
+        elif ccdc_sudo_granted "$name"; then
+            source='effective sudoers'
+        elif [[ " $(id -nG "$name" 2>/dev/null || true) " == *' sudo '* ||
+                " $(id -nG "$name" 2>/dev/null || true) " == *' wheel '* ]]; then
+            source='group hint only'
+        else
+            continue
+        fi
+        state="$(ccdc_account_expiry "$name")"
+        printf '%-23s %-7s %-21s %-14s %s\n' "$name" "$uid" "$source" "$state" "$shell"
+        count=$((count+1))
+    done < <(getent passwd)
+    say "Reviewed $count potentially privileged account(s)."
+    say 'For actual allowed sudo commands: sudo -l -U USERNAME'
+    say 'Group hints alone do not prove permission; only accounts with confirmed sudo privilege are eligible for the optional expiry step.'
+    say 'Also review /etc/sudoers, /etc/sudoers.d/ and any external IAM/polkit rules.'
+    say 'Account expiration does not revoke active sessions or previously launched processes.'
+}
+
+ccdc_protected_account() {
+    local target="$1" uid service_user current_login
+    uid="$(id -u "$target" 2>/dev/null || true)"
+    if [[ ! "$uid" =~ ^[0-9]+$ || "$uid" -lt 1000 ]]; then
+        warn 'Refusing: system/service accounts and UID 0 must not be expired by this script.'
+        return 0
+    fi
+    if [[ -n "${SUDO_USER:-}" && "$target" == "$SUDO_USER" ]]; then
+        warn 'Refusing: this is the user who invoked sudo.'
+        return 0
+    fi
+    current_login="$(logname 2>/dev/null || true)"
+    if [[ -n "$current_login" && "$target" == "$current_login" ]]; then
+        warn 'Refusing: this is the detected console login user.'
+        return 0
+    fi
+    if who 2>/dev/null | awk '{print $1}' | grep -Fxq -- "$target"; then
+        warn 'Refusing: user has an active terminal session; review it manually.'
+        return 0
+    fi
+    service_user="$(ps -eo user=,comm= | awk '$2=="splunkd" {print $1;exit}' || true)"
+    if [[ -n "$service_user" && "$target" == "$service_user" ]]; then
+        warn 'Refusing: this account is running Splunk.'
+        return 0
+    fi
+    case "$target" in splunk|splunkfwd|clamav|suricata|daemon|nobody|_apt)
+        warn 'Refusing: known service account.';return 0;;
+    esac
+    # Require a local entry: usermod generally does not manage remote NSS/LDAP identities.
+    if ! awk -F: -v u="$target" '$1==u {found=1} END{exit !found}' /etc/passwd; then
+        warn 'Refusing: account is not local to /etc/passwd; handle directory-managed users separately.'
+        return 0
+    fi
+    return 1
+}
+
+ccdc_expire_selected_admins() {
+    local target confirm console_ok='' root_pw
+    say ''
+    say '=== OPTIONAL: expire selected privileged Linux accounts ==='
+    say 'Never expire every sudo account: preserve a tested administrative recovery path.'
+    say 'This disables new console AND SSH logins for the selected user; it does not end active sessions.'
+    if ! yesno 'Review and optionally expire a specific privileged Linux user?'; then
+        say 'No account expiration requested.'
+        return 0
+    fi
+    ccdc_audit_admins
+    root_pw="$(passwd -S root 2>/dev/null | awk '{print $2}' || true)"
+    if [[ "$root_pw" != 'P' ]]; then
+        warn 'Root does not have a usable password (passwd -S root != P). Account expiration is disabled.'
+        return 0
+    fi
+    read -r -p 'Have you personally tested a NEW root login via NETLAB console? Type ROOT-CONSOLE-VERIFIED: ' console_ok || true
+    if [[ "$console_ok" != 'ROOT-CONSOLE-VERIFIED' ]]; then
+        warn 'Skipping account expiration: a tested console recovery path was not confirmed.'
+        return 0
+    fi
+    while true; do
+        say ''
+        read -r -p 'Exact Linux username to expire (Enter to finish): ' target || break
+        [[ -n "$target" ]] || break
+        if [[ ! "$target" =~ ^[a-z_][a-z0-9_.-]*\$?$ ]]; then
+            warn 'Invalid local account name; skipped.';continue
+        fi
+        if ! id "$target" >/dev/null 2>&1; then
+            warn 'Unknown account; skipped.';continue
+        fi
+        if ccdc_protected_account "$target"; then
+            continue
+        fi
+        if ! ccdc_is_privileged_account "$target"; then
+            warn 'Not listed as sudo/UID0/wheel privileged; account unchanged.';continue
+        fi
+        if [[ "$(ccdc_account_expiry "$target")" == 'expired' ]]; then
+            warn 'This account already appears expired.';continue
+        fi
+        say "You are about to expire $target. This blocks NEW interactive/SSH logins for the account."
+        read -r -p "To confirm, type exactly 'EXPIRE $target': " confirm || true
+        if [[ "$confirm" != "EXPIRE $target" ]]; then
+            say 'Skipped.';continue
+        fi
+        if usermod --expiredate 1970-01-02 "$target"; then
+            if [[ "$(getent shadow "$target" 2>/dev/null | awk -F: '{print $8}')" == '1' ]]; then
+                say "PASS | Account expired: $target"
+                say "Undo: sudo usermod --expiredate '' $target"
+            else
+                warn "Expiration was requested but /etc/shadow verification was inconclusive for $target"
+                CCDC_SETUP_ERRORS=$((CCDC_SETUP_ERRORS+1))
+            fi
+        else
+            fail "Failed to expire $target"
+        fi
+    done
 }
 
 ccdc_apply_ssh_restriction() {
@@ -431,12 +582,20 @@ ccdc_verification() {
     say 'INFO | This script does not confirm scored-service reachability from NETLAB judges.'
     say 'INFO | Suricata only sees traffic visible to the Debian VM interface.'
     say 'INFO | Confirm actual EVE/ClamAV indexing by searching Splunk after it reloads.'
+    if command -v passwd >/dev/null 2>&1; then
+        say "INFO | Linux root password status: $(passwd -S root 2>/dev/null | awk '{print $2}' || echo unknown) (P=usable, L=locked, NP=no password)"
+    fi
+    say 'INFO | Review privileged Linux accounts separately with: sudo bash setup-splunk.sh --audit-admins'
     if ((failed)); then say 'RESULT | WARNINGS/FAILURES — investigate before relying on this setup';return 1;fi
     say 'RESULT | Static service/configuration checks passed (live detections not proven).'
 }
 
 case "${1:-}" in
-    --help|-h) say 'Usage: sudo bash setup-splunk.sh [--verify|--help]'; exit 0;;
+    --help|-h) say 'Usage: sudo bash setup-splunk.sh [--verify|--audit-admins|--help]'; exit 0;;
+    --audit-admins)
+        [[ $EUID -eq 0 ]] || { say 'Run --audit-admins with sudo';exit 1; }
+        ccdc_audit_admins
+        exit 0;;
     --verify)
         [[ $EUID -eq 0 ]] || { say 'Run --verify with sudo';exit 1; }
         command -v ss >/dev/null 2>&1 || { say 'ss is required for verification';exit 1; }
@@ -475,9 +634,10 @@ if yesno 'Refresh Debian package list (no upgrade unless separately approved)?';
         fi
     else warn 'Package list refresh failed.'; fi
 fi
-if yesno 'Change existing Splunk admin password?'; then
-    ccdc_change_admin_password || fail 'Splunk admin password update failed'
+if yesno 'Change Debian Linux root password interactively? (does not change Splunk Web admin)'; then
+    ccdc_change_root_password || fail 'Linux root password update failed'
 fi
+ccdc_expire_selected_admins
 ccdc_configure_receiver || fail 'Splunk receiver setup failed'
 ccdc_configure_lockout || fail 'Splunk lockout setup failed'
 ccdc_apply_ssh_restriction || fail 'SSH restriction failed'
