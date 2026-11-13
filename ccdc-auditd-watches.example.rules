@@ -1,0 +1,37 @@
+# CCDC example auditd file-change watches (NOT auto-installed).
+# Requires auditd installed and running. Review path existence and approved
+# changes first. Only stage on disposable VM after validating scoring stability.
+# Do NOT put -D or -e 2 here: do not erase/lock other teams' active audit rules.
+# `-p wa` tracks file write and attribute changes. It does NOT detect every
+# successful exploit or every possible privilege escalation.
+# Install only the applicable lines in /etc/audit/rules.d/50-ccdc.rules.
+# If a watched path is absent, remove that rule before loading.
+
+# Identity and privilege configuration
+-w /etc/passwd -p wa -k ccdc-identity
+-w /etc/group -p wa -k ccdc-identity
+-w /etc/shadow -p wa -k ccdc-identity
+-w /etc/gshadow -p wa -k ccdc-identity
+-w /etc/sudoers -p wa -k ccdc-privilege
+-w /etc/sudoers.d -p wa -k ccdc-privilege
+
+# Remote administration and startup persistence
+-w /etc/ssh -p wa -k ccdc-ssh-config
+-w /etc/systemd/system -p wa -k ccdc-startup
+-w /etc/cron.d -p wa -k ccdc-startup
+-w /etc/crontab -p wa -k ccdc-startup
+-w /usr/local/sbin -p wa -k ccdc-startup
+
+# Splunk config and scripted execution configuration; avoid mutable index data
+-w /opt/splunk/etc/system/local -p wa -k ccdc-splunk-conf
+# Optional, assess volume during dashboard installation before uncommenting:
+# -w /opt/splunk/etc/apps -p wa -k ccdc-splunk-apps
+
+# Follow-up after installation (not executable instructions in this rules file):
+#   sudo augenrules --load
+#   sudo auditctl -l
+#   sudo ausearch -k ccdc-identity -ts recent
+#   sudo auditctl -s  # Confirm enabled and no unexpected backlog/lost events
+# Notes: Debian audit documentation distinguishes watch paths from the
+# kernel's effective rules; rule load success and actual benign test events
+# must be verified separately. Centralize logs only after checking license.
