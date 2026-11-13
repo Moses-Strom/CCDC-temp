@@ -1124,6 +1124,45 @@ else
 fi
 
 # ==========================================================
+# Create Splunk Analyst Account
+# ==========================================================
+
+echo "=== Setting Up Splunk Analyst Account ==="
+
+ANALYST_URL="https://raw.githubusercontent.com/Moses-Strom/CCDC-temp/refs/heads/main/Dashboards/create-splunk-analyst.py"
+
+ANALYST_SCRIPT="$(mktemp /tmp/ccdc-analyst.XXXXXXXX.py)"
+ANALYST_LOG="$(mktemp /tmp/ccdc-analyst-output.XXXXXXXX)"
+
+# Download analyst account creation script
+if ! wget -q -O "$ANALYST_SCRIPT" "$ANALYST_URL"; then
+    echo "FAIL | Could not download analyst setup script"
+    rm -f "$ANALYST_SCRIPT" "$ANALYST_LOG"
+    exit 1
+fi
+
+echo "PASS | Analyst setup script downloaded"
+
+# Run Python script interactively
+if python3 -u "$ANALYST_SCRIPT" | tee "$ANALYST_LOG"; then
+    if grep -q "^SUCCESS: Splunk Web account " "$ANALYST_LOG"; then
+        echo "PASS | Splunk Analyst account created successfully"
+    else
+        echo "SKIP | Analyst account creation was not completed"
+    fi
+else
+    echo "FAIL | Splunk Analyst account setup failed"
+    rm -f "$ANALYST_SCRIPT" "$ANALYST_LOG"
+    exit 1
+fi
+
+# Cleanup
+rm -f "$ANALYST_SCRIPT" "$ANALYST_LOG"
+
+echo "=== Splunk Analyst Setup Complete ==="
+echo ""
+
+# ==========================================================
 # Remaining original configuration, package updates and optional downloads.
 # Splunk can remain available while these execute in the NETLAB console.
 # ==========================================================
