@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CCDC | Debian 12 / Splunk Enterprise 10.0.2 server setup
+# CCDC | Debian 12 / Splunk Enterprise 10.0.x server setup
 # Intended VM: 172.20.240.20 (verify in your actual CCDC pod)
 # Includes Splunk receiver/auth protection + SSH restriction + interactive Linux root
 # password rotation + optional administrator account audit/expiry
@@ -33,6 +33,16 @@ CCDC_EXPIRED_ACCOUNTS=()
 CCDC_SPLUNK_CREDENTIALS_BEFORE=''
 CCDC_ANALYST_CREATED=0
 CCDC_ANALYST_CREDENTIALS_AFTER=''
+# Status for optional GitHub-hosted hardening features during THIS invocation.
+# Standalone --verify reports independently observable settings instead.
+CCDC_UPGRADE_STATUS=SKIP
+CCDC_SECURITY_AUDIT_STATUS=SKIP
+CCDC_POSTGRES_STATUS=SKIP
+CCDC_LOOKUP_STATUS=SKIP
+CCDC_GATEWAY_STATUS=SKIP
+CCDC_AUDITD_STATUS=SKIP
+CCDC_LOGCOVERAGE_STATUS=SKIP
+CCDC_ANALYST_STATUS=SKIP
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN | %s\n' "$*" >&2; }
@@ -1142,6 +1152,98 @@ ccdc_verification() {
     else
         say 'SKIP | auditd file-change watches not installed'
     fi
+    say '-----------------------------------------------------------'
+    say ' CCDC Additional Hardening Verification (PASS/FAIL/SKIP/REVIEW)'
+    say '-----------------------------------------------------------'
+    local upgrade_version='' selected_target="${CCDC_SPLUNK_TARGET_VERSION:-10.0.12}"
+    upgrade_version="$(dpkg-query -W -f='${Version}' splunk 2>/dev/null || true)"
+    if [[ "$CCDC_UPGRADE_STATUS" == FAIL ]]; then
+        say 'FAIL | Optional Splunk upgrade helper failed'; failed=1
+    elif [[ -n "$upgrade_version" ]] && dpkg --compare-versions "$upgrade_version" ge "$selected_target"; then
+        say "PASS | Splunk installed version $upgrade_version meets approved target $selected_target"
+    elif [[ "$CCDC_UPGRADE_STATUS" == SKIP ]]; then
+        say "SKIP | Splunk upgrade not completed/selected; installed ${upgrade_version:-unknown}"
+        say "REVIEW | Upgrade to at least $selected_target to address known 10.0.x security issues"
+    else
+        say "FAIL | Installed Splunk version ${upgrade_version:-unknown} remains below requested $selected_target"
+        failed=1
+    fi
+    case "$CCDC_SECURITY_AUDIT_STATUS" in
+        PASS) say 'PASS | Pre-setup read-only security inventory executed (results require review)' ;;
+        FAIL) say 'FAIL | Pre-setup audit helper failed'; failed=1 ;;
+        *) say 'SKIP | Pre-setup security audit not executed in this invocation' ;;
+    esac
+    local server_effective='' sidecar_off=0
+    server_effective="$("$SPLUNK_BIN" cmd btool server list postgres 2>/dev/null || true)"
+    if grep -Eiq '^[[:space:]]*disabled[[:space:]]*=[[:space:]]*(true|1)([[:space:]]|$)' <<< "$server_effective"; then sidecar_off=1; fi
+    if [[ "$CCDC_POSTGRES_STATUS" == FAIL ]]; then
+        say 'FAIL | Requested PostgreSQL-sidecar mitigation did not complete'; failed=1
+    elif ((sidecar_off)); then
+        say 'PASS | Effective Splunk PostgreSQL sidecar configuration reports disabled (restart still relevant)'
+    elif [[ "$CCDC_POSTGRES_STATUS" == PASS ]]; then
+        say 'FAIL | PostgreSQL helper returned success, but effective disabled setting is absent';failed=1
+    elif [[ -n "$upgrade_version" ]] && dpkg --compare-versions "$upgrade_version" ge 10.0.7; then
+        say 'SKIP | PostgreSQL sidecar workaround not required for CVE-2026-20253 at this fixed version'
+    else
+        say 'REVIEW | Vulnerable Splunk version; PostgreSQL sidecar workaround not confirmed'
+    fi
+    local lookup_effective=''
+    lookup_effective="$("$SPLUNK_BIN" cmd btool limits list lookup 2>/dev/null || true)"
+    if [[ "$CCDC_LOOKUP_STATUS" == FAIL ]]; then
+        say 'FAIL | Requested post-upgrade lookup-write hardening failed';failed=1
+    elif grep -Eiq '^[[:space:]]*scripted_lookup_raw_write_enforcement[[:space:]]*=[[:space:]]*block([[:space:]]|$)' <<< "$lookup_effective"; then
+        say 'PASS | Effective scripted_lookup_raw_write_enforcement = block (restart needed to activate changes)'
+    elif [[ "$CCDC_LOOKUP_STATUS" == PASS ]]; then
+        say 'FAIL | Lookup helper completed but effective required setting absent';failed=1
+    elif [[ -n "$upgrade_version" ]] && dpkg --compare-versions "$upgrade_version" ge 10.0.10; then
+        say 'REVIEW | Post-upgrade CVE-2026-76264 lookup setting is not confirmed'
+    else
+        say 'SKIP | Lookup configuration remediation requires upgrading Splunk first'
+    fi
+    local gw="$SPLUNK_HOME/etc/apps/splunk_secure_gateway" gw_conf="$SPLUNK_HOME/etc/apps/splunk_secure_gateway/local/app.conf"
+    if [[ "$CCDC_GATEWAY_STATUS" == FAIL ]]; then
+        say 'FAIL | Requested Secure Gateway mitigation failed';failed=1
+    elif [[ ! -d "$gw" ]]; then
+        say 'SKIP | Secure Gateway not found at the expected app path (check for alternate paths)'
+    elif [[ -f "$gw_conf" ]] && awk '
+        /^\[/{in_install=(tolower($0)=="[install]");next}
+        in_install && tolower($0) ~ /^[[:space:]]*state[[:space:]]*=[[:space:]]*disabled([[:space:]]|$)/{ok=1}
+        END{exit !ok}
+    ' "$gw_conf"; then
+        say 'PASS | Secure Gateway local app state set to disabled; confirm effective state after restart'
+    elif [[ "$CCDC_GATEWAY_STATUS" == PASS ]]; then
+        say 'FAIL | Gateway helper returned success, but app local state not disabled';failed=1
+    else
+        say 'REVIEW | Secure Gateway app present; verify app is updated to advisory-fixed release or unused'
+    fi
+    if [[ "$CCDC_AUDITD_STATUS" == FAIL ]]; then
+        say 'FAIL | Requested auditd installation/ACL work failed'; failed=1
+    elif command -v auditctl >/dev/null 2>&1 && systemctl is-active --quiet auditd.service &&
+         auditctl -l 2>/dev/null | grep -Eq -- '(-k[[:space:]]+|key=)ccdc_'; then
+        say 'PASS | auditd service active and CCDC watch rules loaded'
+        if [[ -f /var/log/audit/audit.log && -r /var/log/audit/audit.log ]]; then
+            say 'PASS | Local audit.log exists and is root-readable'
+        else say 'REVIEW | audit.log absent/unreadable; investigate before claiming ingestion'; fi
+        say 'REVIEW | Verify that a harmless monitored change appears in Splunk (not provable offline)'
+    elif [[ "$CCDC_AUDITD_STATUS" == PASS ]]; then
+        say 'FAIL | auditd helper returned success, but watch rules/service not confirmed'; failed=1
+    else
+        say 'SKIP | auditd CCDC watch rules not present/active'
+    fi
+    case "$CCDC_LOGCOVERAGE_STATUS" in
+        PASS) say 'PASS | Local Linux log coverage diagnostic ran; indexed coverage still unverified' ;;
+        FAIL) say 'FAIL | Local Linux logging diagnostic failed'; failed=1 ;;
+        *) say 'SKIP | Local Linux logging diagnostic not run in this invocation' ;;
+    esac
+    case "$CCDC_ANALYST_STATUS" in
+        PASS) say 'PASS | Analyst helper ran successfully; verify role in Splunk Web' ;;
+        FAIL) say 'FAIL | Analyst helper failed'; failed=1 ;;
+        REVIEW) say 'REVIEW | Analyst helper outcome needs inspection' ;;
+        *) say 'SKIP | Analyst creation/verification not run in this invocation' ;;
+    esac
+    if [[ "$CCDC_IPV6_UFW_SET" -eq 0 ]]; then
+        say 'SKIP | IPv6 UFW block not newly requested this invocation (existing UFW evaluated above)'
+    fi
     df -h "$SPLUNK_HOME" | tail -n 1 || true
     if [[ "$CCDC_SETUP_ERRORS" -gt 0 ]]; then
         say "FAIL | $CCDC_SETUP_ERRORS setup operation(s) reported errors"
@@ -1184,7 +1286,10 @@ fi
 
 # Optional pre-setup inspection before dashboard execution, firewall or auth edits.
 if yesno 'Run read-only security audit before changing this host?'; then
-    if ! ccdc_run_github_helper bash Setup/ccdc-readonly-security-audit.sh --pre-restart; then
+    if ccdc_run_github_helper bash Setup/ccdc-readonly-security-audit.sh --pre-restart; then
+        CCDC_SECURITY_AUDIT_STATUS=PASS
+    else
+        CCDC_SECURITY_AUDIT_STATUS=FAIL
         warn 'Pre-setup security audit failed or is unavailable.'
         if ! yesno 'Continue setup despite the audit failure?'; then
             say 'STOP | Review audit failure before continuing.'
@@ -1193,7 +1298,32 @@ if yesno 'Run read-only security audit before changing this host?'; then
     fi
 fi
 
-# Set credential baseline before invoking the dashboard installer.
+# Optional Splunk maintenance upgrade at the START of setup, AFTER an opportunity
+# for pre-setup inspection and BEFORE any dashboards/config/credential baselines.
+# The helper fetches Splunk's official Debian package and SHA512, verifies them,
+# saves a LOCAL config archive, and requires explicit downtime confirmation.
+# Downtime can affect scored Web, management and query services: test in a VM.
+if yesno 'Upgrade installed Splunk Enterprise to the approved 10.0.x maintenance release now? (downtime / large download)'; then
+    if ccdc_run_github_helper bash Setup/ccdc-upgrade-splunk.sh --upgrade; then
+        CCDC_UPGRADE_STATUS=PASS
+        say 'PASS | Upgrade helper completed; verify installed version and scored services'
+    else
+        ccdc_upgrade_rc=$?
+        if [[ "$ccdc_upgrade_rc" -eq 3 ]]; then
+            CCDC_UPGRADE_STATUS=SKIP
+            say 'SKIP | Upgrade canceled before the package installation'
+        else
+            CCDC_UPGRADE_STATUS=FAIL
+            fail 'Splunk upgrade failed: do not assume the previous version/service state is intact'
+            if ! yesno 'Continue setup despite failed upgrade? (not recommended)'; then
+                say 'STOP | Investigate upgrade failure, service and config before running more scripts'
+                exit 1
+            fi
+        fi
+    fi
+fi
+
+# Set credential baseline after any authorized Splunk package migration.
 if [[ -f "$SPLUNK_HOME/etc/passwd" ]] && command -v sha256sum >/dev/null 2>&1; then
     CCDC_SPLUNK_CREDENTIALS_BEFORE="$(sha256sum "$SPLUNK_HOME/etc/passwd" | awk '{print $1}')"
 fi
@@ -1255,8 +1385,10 @@ ccdc_setup_monitoring_input || fail 'Splunk AV/IDS input setup failed'
 # Helper edits server.conf only when confirmed; intended early restart follows.
 if yesno 'Review/apply PostgreSQL sidecar mitigation before Splunk restart?'; then
     if ccdc_run_github_helper bash Setup/ccdc-mitigate-postgres.sh --apply; then
+        CCDC_POSTGRES_STATUS=PASS
         say 'PASS | Sidecar mitigation helper completed'
     else
+        CCDC_POSTGRES_STATUS=FAIL
         fail 'Sidecar mitigation failed or was declined; review exposure and dependency requirements'
     fi
 fi
@@ -1266,8 +1398,10 @@ fi
 # Review/modify config BEFORE the existing early restart; no extra restart.
 if yesno 'Apply post-upgrade scripted-lookup raw-write enforcement? (10.0.10+ only)'; then
     if ccdc_run_github_helper bash Setup/ccdc-post-upgrade-cve-hardening.sh --apply; then
+        CCDC_LOOKUP_STATUS=PASS
         say 'PASS | Post-upgrade lookup enforcement configured'
     else
+        CCDC_LOOKUP_STATUS=FAIL
         fail 'Post-upgrade CVE configuration not applied; review Splunk version'
     fi
 fi
@@ -1275,9 +1409,11 @@ fi
 # Does not update Secure Gateway app; upgrade it separately when applicable.
 if yesno 'Disable Splunk Secure Gateway app if unused (breaks Mobile/Spacebridge/Mission Control)?'; then
     if ccdc_run_github_helper bash Setup/ccdc-post-upgrade-cve-hardening.sh --disable-secure-gateway; then
+        CCDC_GATEWAY_STATUS=PASS
         say 'PASS | Secure Gateway disable configured'
     else
-        warn 'Secure Gateway remains unchanged; check app version and advisory'
+        CCDC_GATEWAY_STATUS=FAIL
+        fail 'Secure Gateway change failed/declined; check actual app version and advisory'
     fi
 fi
 
@@ -1306,6 +1442,7 @@ fi
 # Existing analyst roles/users are inspected, never overwritten automatically.
 # ==========================================================
 if yesno 'Create or verify a limited Splunk analyst account now?'; then
+    CCDC_ANALYST_STATUS=REVIEW
     say '=== Optional Splunk Analyst Account Setup ==='
     ANALYST_SCRIPT=''
     ANALYST_LOG=''
@@ -1331,20 +1468,24 @@ import sys
 ast.parse(Path(sys.argv[1]).read_text(encoding='utf-8'))
 PY_ANALYST_VALIDATE
     then
+        CCDC_ANALYST_STATUS=FAIL
         fail 'Analyst helper missing, empty or invalid; remaining setup will continue'
     elif python3 -u "$ANALYST_SCRIPT" | tee "$ANALYST_LOG"; then
         if grep -q '^SUCCESS: Splunk Web account ' "$ANALYST_LOG"; then
             # Deliberate account creation changes /opt/splunk/etc/passwd.
             # Keep a separate post-creation hash so later unexpected changes are visible.
             CCDC_ANALYST_CREATED=1
+            CCDC_ANALYST_STATUS=PASS
             CCDC_ANALYST_CREDENTIALS_AFTER="$(sha256sum "$SPLUNK_HOME/etc/passwd" 2>/dev/null | awk '{print $1}' || true)"
             say 'REVIEW | Authorized analyst creation changed Splunk credentials; validate original admin login.'
         elif grep -qE '^SKIP: Analyst account |^PASS \| Existing role' "$ANALYST_LOG"; then
+            CCDC_ANALYST_STATUS=PASS
             say 'PASS | Existing analyst role/account verified or helper skipped changes'
         else
             say 'INFO | Analyst helper completed without creating an account; inspect its output.'
         fi
     else
+        CCDC_ANALYST_STATUS=FAIL
         fail 'Analyst helper returned an error; remaining setup will continue'
     fi
     # Delete only temporary scripts, not an offline copy.
@@ -1394,16 +1535,23 @@ fi
 # audit.log monitor was installed BEFORE the restart; refresh permissions below.
 if yesno 'Install auditd file-change monitoring on this Debian Splunk VM?'; then
     if ccdc_run_github_helper bash Setup/ccdc-install-auditd.sh --install; then
+        CCDC_AUDITD_STATUS=PASS
         say 'PASS | auditd helper completed; verify event ingestion'
-        ccdc_setup_monitoring_input || fail 'auditd/Splunk audit.log ACL refresh failed'
+        ccdc_setup_monitoring_input || { CCDC_AUDITD_STATUS=FAIL; fail 'auditd/Splunk audit.log ACL refresh failed'; }
     else
+        CCDC_AUDITD_STATUS=FAIL
         fail 'auditd setup failed or was declined; inspect auditd report'
     fi
 fi
 
 # Local host diagnosis only; other Linux VMs need this check on their own hosts.
 if yesno 'Run local Linux logging/forwarder coverage diagnostic?'; then
-    ccdc_run_github_helper bash Setup/check-linux-log-coverage.sh || warn 'Linux logging diagnostic failed'
+    if ccdc_run_github_helper bash Setup/check-linux-log-coverage.sh; then
+        CCDC_LOGCOVERAGE_STATUS=PASS
+    else
+        CCDC_LOGCOVERAGE_STATUS=FAIL
+        fail 'Linux logging diagnostic could not complete'
+    fi
 fi
 
 ccdc_verification final
