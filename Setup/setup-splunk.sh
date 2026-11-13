@@ -31,8 +31,6 @@ CCDC_SURICATA_REQUESTED=0
 CCDC_SPLUNK_RESTART_REQUESTED=0
 CCDC_EXPIRED_ACCOUNTS=()
 CCDC_SPLUNK_CREDENTIALS_BEFORE=''
-CCDC_ANALYST_CREATED=0
-CCDC_ANALYST_CREDENTIALS_AFTER=''
 # Status for optional GitHub-hosted hardening features during THIS invocation.
 # Standalone --verify reports independently observable settings instead.
 CCDC_UPGRADE_STATUS=SKIP
@@ -42,7 +40,6 @@ CCDC_LOOKUP_STATUS=SKIP
 CCDC_GATEWAY_STATUS=SKIP
 CCDC_AUDITD_STATUS=SKIP
 CCDC_LOGCOVERAGE_STATUS=SKIP
-CCDC_ANALYST_STATUS=SKIP
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN | %s\n' "$*" >&2; }
@@ -957,15 +954,7 @@ ccdc_verification() {
        [[ "$(ccdc_account_expiry root)" != expired ]]; then
         say 'PASS | Linux root account exists and is not expired'
     else say 'FAIL | Linux root account missing or expired'; failed=1; fi
-    if [[ "$CCDC_ANALYST_CREATED" -eq 1 ]]; then
-        credential_now="$(sha256sum "$SPLUNK_HOME/etc/passwd" 2>/dev/null | awk '{print $1}' || true)"
-        if [[ -n "$CCDC_ANALYST_CREDENTIALS_AFTER" && "$credential_now" == "$CCDC_ANALYST_CREDENTIALS_AFTER" ]]; then
-            say 'REVIEW | Splunk credential store updated by approved analyst creation; verify admin login and analyst permissions'
-        else
-            say 'FAIL | Splunk credential store changed after approved analyst creation or is unreadable'
-            failed=1
-        fi
-    elif [[ -n "$CCDC_SPLUNK_CREDENTIALS_BEFORE" ]]; then
+    if [[ -n "$CCDC_SPLUNK_CREDENTIALS_BEFORE" ]]; then
         credential_now="$(sha256sum "$SPLUNK_HOME/etc/passwd" 2>/dev/null | awk '{print $1}' || true)"
         if [[ -n "$credential_now" && "$credential_now" == "$CCDC_SPLUNK_CREDENTIALS_BEFORE" ]]; then
             say 'PASS | Splunk credential store unchanged during this setup run'
@@ -1235,12 +1224,6 @@ ccdc_verification() {
         FAIL) say 'FAIL | Local Linux logging diagnostic failed'; failed=1 ;;
         *) say 'SKIP | Local Linux logging diagnostic not run in this invocation' ;;
     esac
-    case "$CCDC_ANALYST_STATUS" in
-        PASS) say 'PASS | Analyst helper ran successfully; verify role in Splunk Web' ;;
-        FAIL) say 'FAIL | Analyst helper failed'; failed=1 ;;
-        REVIEW) say 'REVIEW | Analyst helper outcome needs inspection' ;;
-        *) say 'SKIP | Analyst creation/verification not run in this invocation' ;;
-    esac
     if [[ "$CCDC_IPV6_UFW_SET" -eq 0 ]]; then
         say 'SKIP | IPv6 UFW block not newly requested this invocation (existing UFW evaluated above)'
     fi
@@ -1437,63 +1420,43 @@ else
 fi
 
 # ==========================================================
-# OPTIONAL Splunk Analyst Account
-# Use the revised create-or-verify Python helper for repeatable setups.
-# Existing analyst roles/users are inspected, never overwritten automatically.
+# Create Splunk Analyst Account
 # ==========================================================
-if yesno 'Create or verify a limited Splunk analyst account now?'; then
-    CCDC_ANALYST_STATUS=REVIEW
-    say '=== Optional Splunk Analyst Account Setup ==='
-    ANALYST_SCRIPT=''
-    ANALYST_LOG=''
-    analyst_ready=0
-    if [[ -n "${CCDC_OFFLINE_ROOT:-}" ]]; then
-        ANALYST_SCRIPT="${CCDC_OFFLINE_ROOT%/}/Dashboards/create-splunk-analyst.py"
-        if [[ -s "$ANALYST_SCRIPT" ]]; then analyst_ready=1; fi
-    else
-        ANALYST_SCRIPT="$(mktemp /tmp/ccdc-analyst.XXXXXXXX.py)"
-        ANALYST_LOG="$(mktemp /tmp/ccdc-analyst-output.XXXXXXXX)"
-        ANALYST_URL="https://raw.githubusercontent.com/Moses-Strom/CCDC-temp/${CCDC_REPO_REF:-main}/Dashboards/create-splunk-analyst.py"
-        if wget --https-only -q --tries=2 --timeout=20 -O "$ANALYST_SCRIPT" "$ANALYST_URL"; then
-            if [[ -s "$ANALYST_SCRIPT" ]]; then analyst_ready=1; fi
-        fi
-    fi
-    if [[ -z "$ANALYST_LOG" ]]; then
-        ANALYST_LOG="$(mktemp /tmp/ccdc-analyst-output.XXXXXXXX)"
-    fi
-    if [[ "$analyst_ready" -ne 1 ]] || ! python3 - "$ANALYST_SCRIPT" <<'PY_ANALYST_VALIDATE'
-import ast
-from pathlib import Path
-import sys
-ast.parse(Path(sys.argv[1]).read_text(encoding='utf-8'))
-PY_ANALYST_VALIDATE
-    then
-        CCDC_ANALYST_STATUS=FAIL
-        fail 'Analyst helper missing, empty or invalid; remaining setup will continue'
-    elif python3 -u "$ANALYST_SCRIPT" | tee "$ANALYST_LOG"; then
-        if grep -q '^SUCCESS: Splunk Web account ' "$ANALYST_LOG"; then
-            # Deliberate account creation changes /opt/splunk/etc/passwd.
-            # Keep a separate post-creation hash so later unexpected changes are visible.
-            CCDC_ANALYST_CREATED=1
-            CCDC_ANALYST_STATUS=PASS
-            CCDC_ANALYST_CREDENTIALS_AFTER="$(sha256sum "$SPLUNK_HOME/etc/passwd" 2>/dev/null | awk '{print $1}' || true)"
-            say 'REVIEW | Authorized analyst creation changed Splunk credentials; validate original admin login.'
-        elif grep -qE '^SKIP: Analyst account |^PASS \| Existing role' "$ANALYST_LOG"; then
-            CCDC_ANALYST_STATUS=PASS
-            say 'PASS | Existing analyst role/account verified or helper skipped changes'
-        else
-            say 'INFO | Analyst helper completed without creating an account; inspect its output.'
-        fi
-    else
-        CCDC_ANALYST_STATUS=FAIL
-        fail 'Analyst helper returned an error; remaining setup will continue'
-    fi
-    # Delete only temporary scripts, not an offline copy.
-    if [[ -z "${CCDC_OFFLINE_ROOT:-}" ]]; then rm -f -- "$ANALYST_SCRIPT"; fi
-    rm -f -- "$ANALYST_LOG"
-else
-    say 'SKIP | Analyst setup not requested'
+
+echo "=== Setting Up Splunk Analyst Account ==="
+
+ANALYST_URL="https://raw.githubusercontent.com/Moses-Strom/CCDC-temp/refs/heads/main/Dashboards/create-splunk-analyst.py"
+
+ANALYST_SCRIPT="$(mktemp /tmp/ccdc-analyst.XXXXXXXX.py)"
+ANALYST_LOG="$(mktemp /tmp/ccdc-analyst-output.XXXXXXXX)"
+
+# Download analyst account creation script
+if ! wget -q -O "$ANALYST_SCRIPT" "$ANALYST_URL"; then
+    echo "FAIL | Could not download analyst setup script"
+    rm -f "$ANALYST_SCRIPT" "$ANALYST_LOG"
+    exit 1
 fi
+
+echo "PASS | Analyst setup script downloaded"
+
+# Run Python script interactively
+if python3 -u "$ANALYST_SCRIPT" | tee "$ANALYST_LOG"; then
+    if grep -q "^SUCCESS: Splunk Web account " "$ANALYST_LOG"; then
+        echo "PASS | Splunk Analyst account created successfully"
+    else
+        echo "SKIP | Analyst account creation was not completed"
+    fi
+else
+    echo "FAIL | Splunk Analyst account setup failed"
+    rm -f "$ANALYST_SCRIPT" "$ANALYST_LOG"
+    exit 1
+fi
+
+# Cleanup
+rm -f "$ANALYST_SCRIPT" "$ANALYST_LOG"
+
+echo "=== Splunk Analyst Setup Complete ==="
+echo ""
 
 # ==========================================================
 # Remaining original configuration, package updates and optional downloads.
