@@ -199,4 +199,3 @@ echo "  Listening TCP ports (expect 22 25 80 110 143 443 587 993 995):"
 echo "    $(ss -Htln | awk '{n=split($4,a,":"); print a[n]}' | sort -nu | tr '\n' ' ')"
 echo
 ok "Done. Log in at http://$(hostname -I | awk '{print $1}')/ as ${TEST_USERS[0]}, send a message to ${TEST_USERS[1]}."
-echo "  Then shut down and take a VMware snapshot named 'clean-stack'."
