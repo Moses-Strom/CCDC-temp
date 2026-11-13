@@ -22,6 +22,14 @@ CCDC_CHANGED_SPLUNK=0
 CCDC_CHANGED_INPUTS=0
 CCDC_RESTARTED=0
 CCDC_UFW_APPLIED=0
+# Verification-only bookkeeping for operations performed in this invocation.
+CCDC_ROOT_PASSWORD_CHANGED=0
+CCDC_ROOT_PASSWORD_REQUESTED=0
+CCDC_CLAMAV_REQUESTED=0
+CCDC_SURICATA_REQUESTED=0
+CCDC_SPLUNK_RESTART_REQUESTED=0
+CCDC_EXPIRED_ACCOUNTS=()
+CCDC_SPLUNK_CREDENTIALS_BEFORE=''
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN | %s\n' "$*" >&2; }
@@ -117,6 +125,7 @@ ccdc_change_root_password() {
     say 'The system passwd utility prompts securely; no password is stored by this script.'
     say 'This does NOT enable root SSH login (root SSH stays denied).'
     if passwd root; then
+        CCDC_ROOT_PASSWORD_CHANGED=1
         say 'PASS | Linux root password change completed.'
     else
         warn 'Linux root password change failed; no automatic account expirations will run.'
@@ -269,6 +278,7 @@ ccdc_expire_selected_admins() {
         fi
         if usermod --expiredate 1970-01-02 "$target"; then
             if [[ "$(getent shadow "$target" 2>/dev/null | awk -F: '{print $8}')" == '1' ]]; then
+                CCDC_EXPIRED_ACCOUNTS+=("$target")
                 say "PASS | Account expired: $target"
                 say "Undo: sudo usermod --expiredate '' $target"
             else
@@ -399,6 +409,126 @@ EOF_SSH
         warn 'ssh.service is not running. Rules will apply next time sshd is started.'
     fi
     say 'SSH restricted for root/sysadmin; other SSH identities are unaffected. Existing sessions stay open.'
+}
+
+
+# Deny privilege elevation in SSH sessions, including NOPASSWD sudo and su.
+# Applies only to the PAM entry points listed below. Console administration is preserved.
+# Does not claim to stop non-PAM privilege mechanisms or already-root processes.
+ccdc_block_ssh_elevation() {
+    say '=== Restrict sudo/su and other PAM-mediated administration over SSH ==='
+    local gate='/usr/local/sbin/ccdc-deny-ssh-elevation'
+    local pam_dir='/etc/pam.d' service target backup_dir backup tmp line
+    local services=(sudo sudo-i su su-l runuser runuser-l polkit-1)
+    local sshd_rule="account requisite pam_exec.so quiet type=account $gate"
+    local rules=(
+        "auth requisite pam_exec.so quiet type=auth $gate"
+        "account requisite pam_exec.so quiet type=account $gate"
+        "session requisite pam_exec.so quiet type=open_session $gate"
+    )
+
+    if ccdc_ssh_session; then warn 'SSH elevation policy cannot be installed from SSH.'; return 1; fi
+    if [[ ! -f "$pam_dir/sudo" || ! -f "$pam_dir/su" ]]; then
+        warn 'Required sudo/su PAM definitions missing; restriction NOT installed.'; return 1
+    fi
+    if ! find /lib /usr/lib -name pam_exec.so -print -quit 2>/dev/null | grep -q .; then
+        warn 'pam_exec.so missing: cannot safely enforce SSH elevation restrictions.'; return 1
+    fi
+    # Securely keep copies of all edited PAM definitions for manual recovery.
+    backup_dir="/root/ccdc-ssh-pam-backup-$(date +%Y%m%d-%H%M%S)-$$"
+    mkdir -m 0700 -p "$backup_dir"
+    install -d -m 0755 /usr/local/sbin
+    tmp="$(mktemp /usr/local/sbin/.ccdc-ssh-elev.XXXXXX)"
+    cat > "$tmp" <<'EOF_ELEVATION_GATE'
+#!/bin/sh
+# PAM runs this from the privilege-elevating process; deny when SSH is an ancestor.
+# SSHD account check: reject ANY UID 0 login, even an unexpected alias for root.
+if [ "${PAM_SERVICE:-}" = sshd ]; then
+    [ -n "${PAM_USER:-}" ] || exit 1
+    user_uid=$(id -u -- "$PAM_USER" 2>/dev/null) || exit 1
+    [ "$user_uid" -ne 0 ]
+    exit $?
+fi
+# sudo/su checks: inherited SSH variables are a conservative denial signal.
+[ -z "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ] || exit 1
+pid="$PPID"
+hops=0
+while [ "$pid" -gt 1 ] 2>/dev/null && [ "$hops" -lt 60 ]; do
+    [ -r "/proc/$pid/comm" ] || break
+    IFS= read -r name < "/proc/$pid/comm" || break
+    case "$name" in sshd|sshd-session) exit 1;; esac
+    parent=$(awk '/^PPid:/ {print $2; exit}' "/proc/$pid/status" 2>/dev/null)
+    case "$parent" in ''|*[!0-9]*) break;; esac
+    pid="$parent"
+    hops=$((hops + 1))
+done
+exit 0
+EOF_ELEVATION_GATE
+    chmod 0755 "$tmp"
+    chown root:root "$tmp"
+    if ! /bin/sh -n "$tmp"; then
+        rm -f "$tmp"
+        warn 'SSH PAM helper syntax invalid; nothing installed.'
+        return 1
+    fi
+    # A test executed from the required local NETLAB console should succeed.
+    if ! /bin/sh "$tmp"; then
+        rm -f "$tmp"
+        warn 'SSH PAM helper rejected local console; nothing installed.'
+        return 1
+    fi
+    mv -f "$tmp" "$gate"
+
+    for service in "${services[@]}"; do
+        target="$pam_dir/$service"
+        [[ -f "$target" ]] || continue
+        if ! cp -p -- "$target" "$backup_dir/$service"; then
+            warn "Could not back up PAM $service; refusing to modify it."
+            return 1
+        fi
+        tmp="$(mktemp "$pam_dir/.ccdc-pam.XXXXXX")"
+        # Do not duplicate exact rules when running setup again.
+        {
+            for line in "${rules[@]}"; do
+                if ! grep -Fqx -- "$line" "$target"; then printf '%s\n' "$line"; fi
+            done
+            cat -- "$target"
+        } > "$tmp"
+        if ! chmod --reference="$target" "$tmp" || ! chown --reference="$target" "$tmp"; then
+            rm -f -- "$tmp"
+            warn "Could not preserve PAM $service permissions; config unchanged."
+            return 1
+        fi
+        if ! mv -f -- "$tmp" "$target"; then
+            rm -f -- "$tmp"
+            warn "Cannot update PAM $service; restore configuration from $backup_dir"
+            return 1
+        fi
+    done
+    # Also block unexpected UID 0 aliases from authenticating through SSHD PAM.
+    target="$pam_dir/sshd"
+    if [[ -f "$target" ]]; then
+        if ! cp -p -- "$target" "$backup_dir/sshd"; then
+            warn 'Cannot back up sshd PAM policy; UID 0 SSH account restriction not installed.'
+            return 1
+        fi
+        if ! grep -Fqx -- "$sshd_rule" "$target"; then
+            tmp="$(mktemp "$pam_dir/.ccdc-pam-sshd.XXXXXX")"
+            { printf '%s\n' "$sshd_rule"; cat -- "$target"; } > "$tmp"
+            if ! chmod --reference="$target" "$tmp" || ! chown --reference="$target" "$tmp" ||
+               ! mv -f -- "$tmp" "$target"; then
+                rm -f -- "$tmp"
+                warn 'Could not safely install sshd UID 0 PAM guard.'
+                return 1
+            fi
+        fi
+    else
+        warn 'sshd PAM policy is missing; cannot protect unexpected UID 0 SSH aliases.'
+        return 1
+    fi
+    say "PAM configuration backups: $backup_dir"
+    say 'SSH-initiated sudo, sudo -i, su and other available PAM elevation services are now restricted.'
+    say 'NOTE: PAM policy cannot guarantee blocking all possible non-PAM privilege mechanisms.'
 }
 
 ccdc_install_clamav() {
@@ -682,114 +812,210 @@ EOF_PROPS
     say "Splunk EVE + ClamAV monitors saved under $app (requires a safe Splunk restart to activate)."
 }
 
+# Verification below is read-only: it never installs or reconfigures services.
+# PASS means the specific check succeeded, not that live CCDC scoring was tested.
 ccdc_verification() {
-    local failed=0 effective p unit
+    local failed=0 warnings=0 checks=0 effective p unit result
+    local ufw_status gate='/usr/local/sbin/ccdc-deny-ssh-elevation'
+    local files=(sudo sudo-i su su-l runuser runuser-l polkit-1)
+    local auth_output inputs_output
+    local credential_now='' account
     say ''
     say '==========================================================='
-    say ' CCDC FINAL VERIFICATION: Splunk / SSH / AV / IDS'
+    if [[ "${1:-}" == 'final' ]]; then
+        say ' CCDC Splunk Server Setup Complete'
+    else
+        say ' CCDC Splunk Server Read-Only Verification'
+    fi
     say '==========================================================='
+    say ' PASS / FAIL / SKIP verification of each setup area'
+    say '-----------------------------------------------------------'
+    # Password rotation can only be proven for this invocation. Root remains protected.
+    if [[ "$CCDC_ROOT_PASSWORD_REQUESTED" -eq 1 ]]; then
+        if [[ "$CCDC_ROOT_PASSWORD_CHANGED" -eq 1 && "$(passwd -S root 2>/dev/null | awk '{print $2}')" == P ]]; then
+            say 'PASS | Interactive Linux root password rotation completed; root remains enabled'
+        else say 'FAIL | Root password rotation not confirmed'; failed=1; fi
+    elif [[ "${1:-}" == 'final' ]]; then
+        say 'SKIP | Root password change was not requested'
+    else
+        say 'SKIP | Root password-change history cannot be verified read-only'
+    fi
+    if [[ "$(id -u root 2>/dev/null || true)" == 0 ]] &&
+       [[ "$(ccdc_account_expiry root)" != expired ]]; then
+        say 'PASS | Linux root account exists and is not expired'
+    else say 'FAIL | Linux root account missing or expired'; failed=1; fi
+    if [[ -n "$CCDC_SPLUNK_CREDENTIALS_BEFORE" ]]; then
+        credential_now="$(sha256sum "$SPLUNK_HOME/etc/passwd" 2>/dev/null | awk '{print $1}' || true)"
+        if [[ -n "$credential_now" && "$credential_now" == "$CCDC_SPLUNK_CREDENTIALS_BEFORE" ]]; then
+            say 'PASS | Splunk credential store unchanged during this setup run'
+        else say 'FAIL | Splunk credential store changed during setup; inspect account state'; failed=1; fi
+    else
+        say 'SKIP | Splunk admin credential integrity: no before/after baseline available'
+    fi
+    # Account expiration is checked for each account changed in this run.
+    if (( ${#CCDC_EXPIRED_ACCOUNTS[@]} )); then
+        for account in "${CCDC_EXPIRED_ACCOUNTS[@]}"; do
+            if [[ "$(ccdc_account_expiry "$account")" == expired ]]; then
+                say "PASS | Requested privileged account remains expired: $account"
+            else say "FAIL | Requested account not expired: $account"; failed=1; fi
+        done
+    else
+        say 'SKIP | No privileged accounts were expired during this invocation'
+    fi
     if [[ -x "$SPLUNK_BIN" ]] && "$SPLUNK_BIN" status >/dev/null 2>&1; then
-        say 'PASS | Splunk process reports running'
-    else warn 'Splunk not running or status unavailable'; failed=1; fi
-    if [[ -x "$SPLUNK_BIN" ]] && "$SPLUNK_BIN" cmd btool inputs list --debug 2>/dev/null | grep -q -F 'splunktcp://9997'; then
-        say 'PASS | Splunk TCP 9997 receiver stanza configured'
-    else warn 'Splunk TCP 9997 receiver not found by btool'; failed=1; fi
-    if [[ -x "$SPLUNK_BIN" ]] && "$SPLUNK_BIN" cmd btool authentication list splunk_auth 2>/dev/null | grep -Eq 'lockoutUsers[[:space:]]*=[[:space:]]*true'; then
-        say 'PASS | Splunk lockoutUsers configured (not proof of runtime activation)'
-    else warn 'Splunk lockout configuration not found'; failed=1; fi
-    for p in 8000 8089 9997; do
-        if port_listening "$p"; then
-            say "PASS | TCP $p listening"
+        say 'PASS | Splunk reports running'
+    else say 'FAIL | Splunk not running or status unavailable'; failed=1; fi
+    if [[ "$CCDC_SPLUNK_RESTART_REQUESTED" -eq 1 ]]; then
+        if [[ "$CCDC_RESTARTED" -eq 1 ]]; then say 'PASS | Requested Splunk restart command succeeded'
+        else say 'FAIL | Requested Splunk restart failed'; failed=1; fi
+    else
+        say 'SKIP | Splunk restart was not requested (or not measurable in --verify mode)'
+    fi
+    # Splunk supports both [splunktcp://9997] and [splunktcp://:9997].
+    # Examine the merged btool stanza rather than relying on one spelling
+    # or an arbitrary fixed number of lines after the header.
+    if inputs_output="$("$SPLUNK_BIN" btool inputs list --debug 2>&1)"; then
+        if awk '
+            /\[splunktcp:\/\/:?9997\]/ { inside=1; found=1; next }
+            inside && /\[[^]]+\]/ { inside=0 }
+            inside && /(^|[[:space:]])disabled[[:space:]]*=[[:space:]]*0([[:space:]]|$)/ { enabled=1 }
+            END { exit !(found && enabled) }
+        ' <<< "$inputs_output"; then
+            say 'PASS | Splunk receiving enabled on TCP 9997 in effective configuration'
         else
-            warn "TCP $p is not currently listening"
-            if [[ " $CCDC_BASELINE_PORTS " == *" $p "* ]]; then
-                warn "Previously listening TCP $p stopped listening"; failed=1
-            elif [[ $CCDC_RESTARTED -eq 0 ]]; then
-                say "INFO | TCP $p might require a planned Splunk restart"
-            else
-                failed=1
-            fi
+            say 'FAIL | btool did not show an enabled TCP 9997 receiver (check inputs.conf and port listener)'
+            failed=1
         fi
+    else
+        say 'FAIL | Splunk btool inputs verification command failed'
+        warn "btool reported: $(tail -n 2 <<< "$inputs_output")"
+        failed=1
+    fi
+    auth_output="$("$SPLUNK_BIN" cmd btool authentication list splunk_auth 2>/dev/null || true)"
+    for result in 'lockoutUsers=true' 'lockoutAttempts=5' 'lockoutThresholdMins=5' 'lockoutMins=30'; do
+        p="${result%%=*}"
+        unit="${result#*=}"
+        if grep -Eiq "^[[:space:]]*$p[[:space:]]*=[[:space:]]*$unit([[:space:]]|$)" <<< "$auth_output"; then
+            say "PASS | Splunk auth setting $p=$unit"
+        else say "FAIL | Splunk auth setting $p=$unit not effective"; failed=1; fi
+    done
+    for p in 22 8000 8089 9997; do
+        if port_listening "$p"; then say "PASS | TCP $p service listening"
+        else say "FAIL | TCP $p service not listening (UFW allowance alone does not start a service)"; failed=1; fi
     done
     if [[ -x /usr/sbin/sshd ]]; then
         effective="$(/usr/sbin/sshd -T -C user=sysadmin,host=localhost,addr=127.0.0.1 2>/dev/null || true)"
         if /usr/sbin/sshd -t >/dev/null 2>&1 &&
            grep -Eq '^denyusers .*root([[:space:]]|$)' <<< "$effective" &&
-           grep -Eq '^denyusers .*sysadmin([[:space:]]|$)' <<< "$effective"; then
-            say 'PASS | root and sysadmin denied NEW SSH logins'
-        else warn 'SSH restrictions not confirmed'; failed=1; fi
-    else say 'SKIP | OpenSSH server is not installed'; fi
+           grep -Eq '^denyusers .*sysadmin([[:space:]]|$)' <<< "$effective" &&
+           grep -Eq '^permitrootlogin no$' <<< "$effective"; then
+            say 'PASS | sshd config denies new root/sysadmin SSH logins'
+        else say 'FAIL | sshd root/sysadmin login restrictions not confirmed'; failed=1; fi
+    else
+        say 'FAIL | OpenSSH daemon unavailable; SSH authorization not verifiable'; failed=1
+    fi
+    # Verify local SSH privilege elevation guard, including sudo NOPASSWD.
+    if [[ -f "$gate" && -x "$gate" && "$(stat -c '%U' "$gate" 2>/dev/null)" == root ]] &&
+       /bin/sh -n "$gate" && /bin/sh "$gate"; then
+        say 'PASS | Console-side PAM SSH elevation helper installed and runs locally'
+        for unit in "${files[@]}"; do
+            [[ -f "/etc/pam.d/$unit" ]] || continue
+            checks=$((checks+1))
+            if grep -Fqx "auth requisite pam_exec.so quiet type=auth $gate" "/etc/pam.d/$unit" &&
+               grep -Fqx "account requisite pam_exec.so quiet type=account $gate" "/etc/pam.d/$unit" &&
+               grep -Fqx "session requisite pam_exec.so quiet type=open_session $gate" "/etc/pam.d/$unit"; then
+                say "PASS | PAM $unit configured to deny SSH-ancestry privilege elevation"
+            else say "FAIL | PAM $unit SSH restriction missing or incomplete"; failed=1; fi
+        done
+        if [[ "$checks" -eq 0 ]]; then say 'FAIL | No monitored PAM elevation services found'; failed=1; fi
+        if [[ -f /etc/pam.d/sshd ]] &&
+           grep -Fqx "account requisite pam_exec.so quiet type=account $gate" /etc/pam.d/sshd &&
+           [[ "$effective" == *$'usepam yes'* ]]; then
+            say 'PASS | sshd PAM policy blocks UID 0 aliases (UsePAM enabled)'
+        else say 'FAIL | sshd PAM UID 0 restriction absent or UsePAM disabled'; failed=1; fi
+        say 'INFO | Test an actual sudo attempt over SSH to validate runtime policy'
+    else say 'FAIL | SSH sudo/su elevation guard missing or cannot run from console'; failed=1; fi
     if command -v ufw >/dev/null 2>&1; then
-        local ufw_status
         ufw_status="$(ufw status verbose 2>&1 || true)"
         if grep -q '^Status: active' <<< "$ufw_status" &&
            grep -Eq '^Default: deny \(incoming\), allow \(outgoing\)' <<< "$ufw_status"; then
-            say 'PASS | UFW active: incoming denied by default, outgoing allowed'
-            for p in 22 8000 8089 9997; do
-                if grep -Eq "^${p}/tcp[[:space:]]+ALLOW IN" <<< "$ufw_status"; then
-                    say "PASS | UFW TCP $p inbound allowance shown"
-                else
-                    warn "UFW TCP $p allowance not confirmed"; failed=1
-                fi
-            done
-        else
-            warn 'UFW not active with expected defaults; inbound isolation NOT verified.'
+            say 'PASS | UFW active with default deny incoming / allow outgoing'
+        else say 'FAIL | UFW inactive or wrong default policy'; failed=1; fi
+        for p in 22 8000 8089 9997; do
+            if grep -Eq "^${p}/tcp[[:space:]]+ALLOW IN" <<< "$ufw_status"; then
+                say "PASS | UFW inbound TCP $p allowed"
+            else say "FAIL | UFW inbound TCP $p missing"; failed=1; fi
+        done
+        # Reject any additional UFW ALLOW IN rules, including IPv6 rules.
+        if awk '$2 == "ALLOW" && $3 == "IN" && $1 !~ /^(22|8000|8089|9997)\/tcp$/ {found=1} END {exit !found}' <<< "$ufw_status"; then
+            say 'FAIL | UFW contains an unexpected additional inbound ALLOW rule'
             failed=1
-        fi
+        else say 'PASS | No additional UFW user inbound ALLOW rules found'; fi
+    else say 'FAIL | UFW not installed'; failed=1; fi
+
+    if [[ "${1:-}" == final && "$CCDC_CLAMAV_REQUESTED" -eq 0 && ! -f /etc/clamav/clamd.conf ]]; then
+        say 'SKIP | ClamAV not selected and not installed'
+    elif [[ -f /etc/clamav/clamd.conf ]] || command -v clamonacc >/dev/null 2>&1; then
+        for unit in clamav-daemon clamav-clamonacc clamav-freshclam; do
+            if systemctl is-active --quiet "$unit.service"; then say "PASS | $unit.service active"
+            else say "FAIL | $unit.service inactive"; failed=1; fi
+        done
+        if grep -Fxq 'OnAccessPrevention no' /etc/clamav/clamd.conf 2>/dev/null &&
+           systemctl cat clamav-clamonacc 2>/dev/null | grep -Fq -- '--fdpass --log=/var/log/clamav/clamonacc.log'; then
+            say 'PASS | ClamAV configured notify-only without automatic quarantine'
+        else say 'FAIL | ClamAV notify-only mode not confirmed'; failed=1; fi
+        if [[ -f /var/log/clamav/clamonacc.log ]]; then say 'PASS | ClamAV on-access log file exists'
+        else say 'FAIL | ClamAV on-access log file missing'; failed=1; fi
+    elif [[ "$CCDC_CLAMAV_REQUESTED" -eq 1 ]]; then
+        say 'FAIL | ClamAV installation requested but not present'; failed=1
     else
-        warn 'UFW not installed: default-deny inbound NOT active.'
-        failed=1
+        say 'SKIP | ClamAV not installed / not requested'
     fi
-    for unit in clamav-daemon clamav-clamonacc clamav-freshclam suricata; do
-        if systemctl is-active --quiet "${unit}.service"; then
-            say "PASS | ${unit}.service active"
-        else warn "${unit}.service is not active (may be intentionally uninstalled or skipped)"; fi
-    done
-    if [[ -f /etc/clamav/clamd.conf ]] && grep -q '^OnAccessPrevention no$' /etc/clamav/clamd.conf; then
-        say 'PASS | ClamAV configured not to block file access'
-    else warn 'ClamAV notify-only configuration not confirmed'; fi
-    if [[ -n "$CCDC_CAPTURE_IFACE" ]] && ip link show dev "$CCDC_CAPTURE_IFACE" >/dev/null 2>&1; then
-        say "PASS | Suricata monitored network interface exists: $CCDC_CAPTURE_IFACE"
-    else
-        say 'INFO | Suricata interface not set in this run; check service arguments if installed.'
-    fi
-    if command -v suricata >/dev/null 2>&1 && [[ -f /etc/suricata/suricata.yaml ]]; then
-        local suricata_test=(suricata -T -c /etc/suricata/suricata.yaml)
-        if [[ -n "$CCDC_CAPTURE_IFACE" ]]; then suricata_test+=("--af-packet=$CCDC_CAPTURE_IFACE"); fi
-        if "${suricata_test[@]}" >/dev/null 2>&1; then
-            say 'PASS | Suricata configuration parses'
-        else warn 'Suricata config test failed'; failed=1; fi
-    fi
-    if [[ -s /var/lib/suricata/rules/suricata.rules ]]; then
-        say 'PASS | Suricata detection rules exist'
-    else
-        warn 'Suricata detection rules missing; alerts may be limited'
-    fi
-    if [[ -f /etc/systemd/system/suricata.service.d/90-ccdc-passive-ids.conf ]]; then
-        if grep -Eq '^ExecStart=.*--af-packet=' /etc/systemd/system/suricata.service.d/90-ccdc-passive-ids.conf; then
-            say 'PASS | Suricata systemd override explicitly uses passive AF_PACKET'
-        else
-            warn 'Suricata passive AF_PACKET override not confirmed'; failed=1
-        fi
-    fi
-    [[ ! -f /var/log/suricata/eve.json ]] || say 'PASS | Suricata EVE JSON file exists'
-    [[ ! -f /var/log/clamav/clamonacc.log ]] || say 'PASS | ClamAV on-access log file exists'
-    [[ ! -f "$SPLUNK_HOME/etc/apps/ccdc_endpoint_ids_inputs/local/inputs.conf" ]] || say 'PASS | Splunk Suricata/ClamAV monitor input files exist'
+
+    if [[ "${1:-}" == final && "$CCDC_SURICATA_REQUESTED" -eq 0 ]] && ! command -v suricata >/dev/null 2>&1; then
+        say 'SKIP | Suricata not selected and not installed'
+    elif command -v suricata >/dev/null 2>&1; then
+        if systemctl is-active --quiet suricata.service; then say 'PASS | suricata.service active'
+        else say 'FAIL | suricata.service inactive'; failed=1; fi
+        if [[ -s /var/lib/suricata/rules/suricata.rules ]]; then say 'PASS | Suricata nonempty signature rules file exists'
+        else say 'FAIL | Suricata signature rules file missing'; failed=1; fi
+        if [[ -f /etc/suricata/suricata.yaml ]] && suricata -T -c /etc/suricata/suricata.yaml >/dev/null 2>&1; then
+            say 'PASS | Suricata YAML and rules validate'
+        else say 'FAIL | Suricata YAML/rule test failed'; failed=1; fi
+        if [[ -f /etc/systemd/system/suricata.service.d/90-ccdc-passive-ids.conf ]] &&
+           grep -Eq '^ExecStart=.*--af-packet=' /etc/systemd/system/suricata.service.d/90-ccdc-passive-ids.conf; then
+            say 'PASS | Suricata configured for passive AF_PACKET capture'
+        else say 'FAIL | Suricata passive capture override missing'; failed=1; fi
+        # Read the configured AF_PACKET interface, even during standalone --verify.
+        local iface=''
+        iface="${CCDC_CAPTURE_IFACE:-$(sed -n 's/.*--af-packet=\([^ ]*\).*/\1/p' /etc/systemd/system/suricata.service.d/90-ccdc-passive-ids.conf 2>/dev/null | head -n 1)}"
+        if [[ -n "$iface" ]] && ip link show dev "$iface" >/dev/null 2>&1; then
+            say "PASS | Suricata capture interface exists: $iface"
+        else say 'FAIL | Suricata capture interface unavailable'; failed=1; fi
+        if [[ -f /var/log/suricata/eve.json ]]; then say 'PASS | Suricata EVE JSON log file exists'
+        else say 'FAIL | Suricata EVE JSON log file missing'; failed=1; fi
+    elif [[ "$CCDC_SURICATA_REQUESTED" -eq 1 ]]; then
+        say 'FAIL | Suricata was requested but not installed'; failed=1
+    else say 'SKIP | Suricata not installed / not requested'; fi
+
+    if [[ -f "$SPLUNK_HOME/etc/apps/ccdc_endpoint_ids_inputs/local/inputs.conf" ]]; then
+        local monitoring_file="$SPLUNK_HOME/etc/apps/ccdc_endpoint_ids_inputs/local/inputs.conf"
+        if grep -Fq '[monitor:///var/log/suricata/eve.json]' "$monitoring_file" &&
+           grep -Fq '[monitor:///var/log/clamav/clamonacc.log]' "$monitoring_file"; then
+            say 'PASS | Splunk local Suricata/ClamAV monitoring inputs configured'
+        else say 'FAIL | Splunk monitoring inputs incomplete'; failed=1; fi
+    elif command -v suricata >/dev/null 2>&1 || command -v clamonacc >/dev/null 2>&1; then
+        say 'FAIL | AV/IDS installed but Splunk log monitoring inputs missing'; failed=1
+    else say 'SKIP | No optional AV/IDS monitoring inputs required'; fi
     df -h "$SPLUNK_HOME" | tail -n 1 || true
-    if [[ $CCDC_SETUP_ERRORS -gt 0 ]]; then
-        warn "$CCDC_SETUP_ERRORS setup operation(s) failed; review output above."
+    if [[ "$CCDC_SETUP_ERRORS" -gt 0 ]]; then
+        say "FAIL | $CCDC_SETUP_ERRORS setup operation(s) reported errors"
         failed=1
-    fi
-    say 'INFO | UFW was changed only if the operator approved APPLY-UFW.'
-    say 'INFO | This script does not confirm scored-service reachability from NETLAB judges.'
-    say 'INFO | Suricata only sees traffic visible to the Debian VM interface.'
-    say 'INFO | Confirm actual EVE/ClamAV indexing by searching Splunk after it reloads.'
-    if command -v passwd >/dev/null 2>&1; then
-        say "INFO | Linux root password status: $(passwd -S root 2>/dev/null | awk '{print $2}' || echo unknown) (P=usable, L=locked, NP=no password)"
-    fi
-    say 'INFO | Review privileged Linux accounts separately with: sudo bash setup-splunk.sh --audit-admins'
-    if ((failed)); then say 'RESULT | WARNINGS/FAILURES — investigate before relying on this setup';return 1;fi
-    say 'RESULT | Static service/configuration checks passed (live detections not proven).'
+    else say 'PASS | No setup operations explicitly reported errors'; fi
+    say 'INFO | These checks are local; CCDC scoring reachability, actual SSH denial and live IDS/AV alerts require separate remote tests.'
+    say 'INFO | PAM restrictions cover standard escalation paths; no mechanism can promise to block all possible privilege-escalation paths.'
+    if ((failed)); then say 'RESULT | FAIL: One or more checks need investigation.';return 1;fi
+    say 'RESULT | PASS: All applicable static/local checks succeeded (live remote behavior unproven).'
 }
 
 case "${1:-}" in
@@ -821,6 +1047,45 @@ if ccdc_ssh_session; then
     exit 3
 fi
 
+# Set credential baseline before invoking the dashboard installer.
+if [[ -f "$SPLUNK_HOME/etc/passwd" ]] && command -v sha256sum >/dev/null 2>&1; then
+    CCDC_SPLUNK_CREDENTIALS_BEFORE="$(sha256sum "$SPLUNK_HOME/etc/passwd" | awk '{print $1}')"
+fi
+
+# ==========================================================
+# Dashboard installation FIRST; the installer itself does not restart Splunk.
+# Run only after the root and local-NETLAB-console preflight above.
+# ==========================================================
+say '=== Download and install CCDC Splunk dashboards ==='
+DASHBOARD_URL='https://raw.githubusercontent.com/Moses-Strom/CCDC-temp/refs/heads/main/Dashboards/setup-dashboards-main.sh'
+if ! command -v wget >/dev/null 2>&1; then
+    say 'FAIL | wget is missing; dashboard installation not attempted.' >&2
+    exit 1
+fi
+DASHBOARD_SCRIPT="$(mktemp /tmp/ccdc-dashboards.XXXXXXXX.sh)"
+if ! wget -q -O "$DASHBOARD_SCRIPT" "$DASHBOARD_URL"; then
+    rm -f -- "$DASHBOARD_SCRIPT"
+    say 'FAIL | Could not download CCDC dashboard installer.' >&2
+    exit 1
+fi
+say 'PASS | Dashboard installer downloaded from GitHub'
+if ! bash "$DASHBOARD_SCRIPT"; then
+    rm -f -- "$DASHBOARD_SCRIPT"
+    say 'FAIL | Dashboard installer failed; stopping before server changes.' >&2
+    exit 1
+fi
+if ! bash "$DASHBOARD_SCRIPT" --verify; then
+    rm -f -- "$DASHBOARD_SCRIPT"
+    say 'FAIL | Dashboard static verification failed; stopping before server changes.' >&2
+    exit 1
+fi
+rm -f -- "$DASHBOARD_SCRIPT"
+say 'PASS | CCDC dashboards installed and statically verified'
+
+# ==========================================================
+# Configure Splunk and network/security access BEFORE its restart.
+# This includes the required inbound ports 22, 8000, 8089, 9997.
+# ==========================================================
 say '=== CCDC Splunk Enterprise Setup (Debian 12) ==='
 say 'Current listening services:'
 ss -lntup
@@ -828,6 +1093,40 @@ snapshot_ports
 if ! ip -o -4 addr show 2>/dev/null | grep -q "$EXPECTED_IP"; then
     warn "This VM may not currently hold the expected IP $EXPECTED_IP. Confirm the actual NETLAB topology."
 fi
+
+ccdc_configure_receiver || fail 'Splunk receiver setup failed'
+ccdc_configure_lockout || fail 'Splunk lockout setup failed'
+ccdc_apply_ssh_restriction || fail 'SSH restriction failed'
+ccdc_block_ssh_elevation || fail 'SSH sudo/su elevation restriction failed'
+ccdc_configure_firewall || fail 'UFW configuration failed'
+
+# Pre-configure Splunk monitoring inputs before restarting, even if optional
+# IDS/AV logs do not exist yet. Refresh their ACLs after optional installs.
+ccdc_setup_monitoring_input || fail 'Splunk AV/IDS input setup failed'
+
+# ==========================================================
+# Restart NOW, before slower apt upgrades, ClamAV and Suricata downloads.
+# Splunk Web and the dashboards can be used while remaining steps run.
+# ==========================================================
+say '=== Restart Splunk to activate dashboards and configured ports ==='
+CCDC_SPLUNK_RESTART_REQUESTED=1
+if "$SPLUNK_BIN" restart; then
+    CCDC_RESTARTED=1
+    say 'PASS | Splunk restart succeeded; dashboards should now be available through Splunk Web.'
+else
+    fail 'Splunk restart failed: fix service before continuing with optional installs'
+    exit 1
+fi
+if port_listening 8000; then
+    say 'PASS | TCP 8000 listening; open Splunk Web in another browser tab.'
+else
+    warn 'TCP 8000 not yet listening; check Splunk Web after startup finishes.'
+fi
+
+# ==========================================================
+# Remaining original configuration, package updates and optional downloads.
+# Splunk can remain available while these execute in the NETLAB console.
+# ==========================================================
 if yesno 'Refresh Debian package list (no upgrade unless separately approved)?'; then
     if apt-get update; then
         apt list --upgradable 2>/dev/null || true
@@ -837,31 +1136,26 @@ if yesno 'Refresh Debian package list (no upgrade unless separately approved)?';
     else warn 'Package list refresh failed.'; fi
 fi
 if yesno 'Change Debian Linux root password interactively? (does not change Splunk Web admin)'; then
+    CCDC_ROOT_PASSWORD_REQUESTED=1
     ccdc_change_root_password || fail 'Linux root password update failed'
 fi
 ccdc_expire_selected_admins
-ccdc_configure_receiver || fail 'Splunk receiver setup failed'
-ccdc_configure_lockout || fail 'Splunk lockout setup failed'
-ccdc_apply_ssh_restriction || fail 'SSH restriction failed'
-ccdc_configure_firewall || fail 'UFW configuration failed'
 
 say ''
 say 'NOTE: ClamAV and Suricata are OPTIONAL because they use RAM, CPU and storage.'
 say '      Both are detection-only; they do not block ports or alter firewall rules.'
 if yesno 'Install/enable ClamAV REAL-TIME on-access notify-only monitoring?'; then
+    CCDC_CLAMAV_REQUESTED=1
     ccdc_install_clamav || fail 'ClamAV configuration failed'
 fi
 if yesno 'Install/enable Suricata passive IDS (AF_PACKET)?'; then
+    CCDC_SURICATA_REQUESTED=1
     ccdc_install_suricata || fail 'Suricata configuration failed'
 fi
 if command -v clamonacc >/dev/null 2>&1 || command -v suricata >/dev/null 2>&1; then
-    ccdc_setup_monitoring_input || fail 'Splunk AV/IDS log input setup failed'
+    # Update ACLs now that the IDS/AV log files may exist. Inputs were already
+    # installed and activated by the earlier Splunk restart.
+    ccdc_setup_monitoring_input || fail 'Splunk AV/IDS log input ACL refresh failed'
 fi
 
-if yesno 'Restart Splunk now to activate pending configuration changes?'; then
-    if "$SPLUNK_BIN" restart; then CCDC_RESTARTED=1; else fail 'Splunk restart failed'; fi
-else
-    warn 'Splunk not restarted: receiver/auth settings and new log monitors may remain pending.'
-fi
-
-ccdc_verification
+ccdc_verification final
