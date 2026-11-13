@@ -1,395 +1,393 @@
 #!/usr/bin/env bash
-# CCDC: snapshot, compare and selectively restore startup/persistence configuration.
-# --baseline records hashes and copies of selected configuration files.
-# --check is read-only. --restore requires explicit console confirmation.
-# Does not automatically restart services, alter users, or remove unknown files.
+# CCDC conservative baseline/check/selective restore prototype.
+# Bash entrypoint; Python 3 standard library handles NUL/newline-safe paths and JSON.
+# No service restarts, firewall changes, user changes, removal/quarantine of added files.
 set -euo pipefail
 umask 077
-
-BASE="/root/ccdc-known-good-startup"
-REPORT_ROOT="/root/ccdc-startup-audits"
-SPLUNK="/opt/splunk/bin/splunk"
-
 usage() {
-  cat <<'HELP'
-Usage: sudo bash ccdc-startup-baseline.sh --baseline|--check|--restore [--dry-run]
-  --baseline          Capture a trusted startup state ONCE, with restorable copies
-                      of selected configuration files (never overwrite an existing baseline).
-  --check             Compare current state to baseline; do not modify services.
-  --restore           Preview changed/deleted baselined configuration files and
-                      ask for explicit confirmation before restoring their content,
-                      owner and permissions. Backs up current versions first.
-  --restore --dry-run Preview without prompting or modifying files.
-Restore does NOT delete unknown added files, restore account databases, alter
-firewall runtime state, or restart/reload services. Inspect unknown persistence
-entries before restarting anything. Older hash-only baselines cannot restore.
-Keep baselines and audit reports root-only; local storage is NOT trusted after
-a root compromise. Never create a baseline on an untrusted host.
-HELP
+  cat <<'USAGE'
+Usage: sudo bash ccdc-baseline-v2.sh --baseline|--check|--restore [--profile host|deployed] [--dry-run] [--deep]
+       LAB ONLY: --lab-root /absolute/test/root [--lab-approve]
+
+--baseline    One-time atomic snapshot (refuses overwrite).
+--profile     deployed (default: full host+Splunk inventory), host (excludes /opt/splunk).
+--check       Read-only comparison; exit 0 clean, 1 differences, 2 errors.
+--restore     Review and selectively recover changed/missing files copied at baseline.
+--dry-run     Preview without writing to live filesystem (with --restore).
+--deep        Run dpkg --verify in live --check mode (may be slow/noisy).
+--lab-root    Synthetic filesystem testing only; never use for real restore.
+--lab-approve Noninteractive restore for the synthetic lab root ONLY.
+
+No remote verification, no full system backup, no assurance of trust after root compromise.
+USAGE
 }
-[[ ${1:-} == --help || ${1:-} == -h ]] && { usage; exit 0; }
-[[ ${EUID} -eq 0 ]] || { echo 'ERROR: Run via sudo or root.' >&2; exit 2; }
-if ! { [[ $# -eq 1 ]] || { [[ $# -eq 2 && $1 == --restore && $2 == --dry-run ]]; }; }; then
-  usage; exit 2
+mode=''; dry=0; deep=0; lab_root=''; lab_approve=0; profile='deployed'
+while (($#)); do
+ case "$1" in
+  --baseline|--check|--restore) [[ -z "$mode" ]] || { usage >&2; exit 2; }; mode="$1";;
+  --profile) [[ $# -ge 2 && ( $2 == host || $2 == deployed ) ]] || { echo 'ERROR: profile must be host or deployed' >&2; exit 2; }; profile="$2"; shift;;
+  --dry-run) dry=1;;
+  --deep) deep=1;;
+  --lab-root) [[ $# -ge 2 ]] || exit 2; lab_root="$2"; shift;;
+  --lab-approve) lab_approve=1;;
+  --help|-h) usage; exit 0;;
+  *) echo "Unknown argument: $1" >&2; usage >&2; exit 2;;
+ esac
+ shift
+done
+[[ -n "$mode" ]] || { usage >&2; exit 2; }
+[[ $(id -u) -eq 0 ]] || { echo 'ERROR: root privileges required' >&2; exit 2; }
+if ((dry)) && [[ "$mode" != --restore ]]; then echo 'ERROR: --dry-run requires --restore' >&2; exit 2; fi
+if ((deep)) && [[ "$mode" != --check ]]; then echo 'ERROR: --deep requires --check' >&2; exit 2; fi
+if [[ -n "$lab_root" ]]; then
+ [[ "$lab_root" == /* && "$lab_root" != / && -d "$lab_root" && ! -L "$lab_root" ]] || { echo 'ERROR: invalid lab root' >&2; exit 2; }
+ root="$(realpath -e -- "$lab_root")"
+ [[ "$root" != / ]] || exit 2
+ state="$root/.ccdc-v2-state${profile/deployed/}"
+ [[ "$profile" != host ]] || state="$root/.ccdc-v2-state-host"
+else
+ root=/
+ state=/root/ccdc-baseline-v2
+ [[ "$profile" != host ]] || state=/root/ccdc-baseline-v2-host
 fi
-
-capture() {
-  local dest="$1" directory path f unit
-  mkdir -p "$dest"
-  # Collect known persistence areas, plus executable/configuration files in Splunk.
-  # Store hashes + metadata, not raw file contents.
-  {
-    for path in \
-      /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system \
-      /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly \
-      /etc/cron.monthly /etc/init.d /var/spool/cron/crontabs \
-      /etc/ssh /etc/sudoers.d /etc/profile.d /etc/udev/rules.d \
-      /etc/network/if-up.d /etc/network/if-pre-up.d /var/spool/cron/atjobs \
-      /usr/local/bin /usr/local/sbin; do
-      [[ -d "$path" ]] && find "$path" -type f -print0
-    done
-    for f in /etc/crontab /etc/rc.local /etc/passwd /etc/group /etc/shadow \
-             /etc/sudoers /etc/ld.so.preload; do
-      [[ -f "$f" ]] && printf '%s\0' "$f"
-    done
-    if [[ -d /opt/splunk/etc ]]; then
-      find /opt/splunk/etc -type f \
-        \( -name '*.conf' -o -name '*.path' -o -name '*.py' \
-           -o -name '*.sh' -o -name '*.service' -o -name '*.js' \
-           -o -name '*.pl' -o -name '*.ps1' -o -name '*.xml' \
-           -o -name '*.html' -o -name '*.css' -o -name '*.json' \
-           -o -name '*.yml' -o -name '*.yaml' -o -perm /111 \) -print0
-    fi
-    for path in /opt/splunk/bin/scripts /opt/splunk/etc/system/bin; do
-      [[ -d "$path" ]] && find "$path" -type f -print0
-    done
-    : # Always succeed when the last optional path is absent.
-  } | LC_ALL=C sort -zu > "$dest/files.nul"
-
-  : > "$dest/file-hashes.txt"
-  : > "$dest/file-permissions.txt"
-  while IFS= read -r -d '' f; do
-    if [[ -f "$f" ]]; then
-      sha256sum -- "$f" >> "$dest/file-hashes.txt" \
-        || printf 'UNREADABLE %s\n' "$f" >> "$dest/file-hashes.txt"
-      stat -c '%a %u %g %n' -- "$f" >> "$dest/file-permissions.txt" \
-        || printf 'UNSTATABLE %s\n' "$f" >> "$dest/file-permissions.txt"
-    fi
-  done < "$dest/files.nul"
-  cp -- "$dest/files.nul" "$dest/file-paths.nul"
-  rm -f "$dest/files.nul"
-  # Track symlink targets separately: changes to startup symlinks can matter.
-  {
-    for path in /etc/systemd/system /etc/cron.d /etc/ssh \
-                /opt/splunk/etc /opt/splunk/bin/scripts; do
-      [[ -d "$path" ]] || continue
-      find "$path" -type l -print0
-    done
-  } | LC_ALL=C sort -zu | while IFS= read -r -d '' f; do
-    printf '%s -> %s\n' "$f" "$(readlink -- "$f")"
-  done > "$dest/symlink-targets.txt"
-
-  systemctl list-unit-files --type=service --state=enabled --no-legend --no-pager \
-      2>&1 | LC_ALL=C sort > "$dest/enabled-services.txt" || true
-  systemctl list-unit-files --type=timer --no-legend --no-pager \
-      2>&1 | LC_ALL=C sort > "$dest/timer-units.txt" || true
-  systemctl list-timers --all --no-pager > "$dest/timer-schedule-current.txt" 2>&1 || true
-  ss -H -lntup 2>&1 | LC_ALL=C sort > "$dest/listening-sockets.txt" || true
-  if command -v atq >/dev/null 2>&1; then
-    atq > "$dest/at-jobs.txt" 2>&1 || true
-  else
-    echo 'at command not installed' > "$dest/at-jobs.txt"
-  fi
-  if command -v ufw >/dev/null 2>&1; then
-    ufw status verbose > "$dest/ufw-status.txt" 2>&1 || true
-  else
-    echo 'ufw not installed' > "$dest/ufw-status.txt"
-  fi
-  if command -v crontab >/dev/null 2>&1; then
-    {
-      while IFS=: read -r user _; do
-        entries="$(crontab -u "$user" -l 2>/dev/null || true)"
-        if [[ -n "$entries" ]]; then
-          printf '\n--- %s ---\n%s\n' "$user" "$entries"
-        fi
-      done < /etc/passwd
-    } > "$dest/user-crontabs.txt"
-  else
-    echo 'crontab command not installed' > "$dest/user-crontabs.txt"
-  fi
-  {
-    while read -r unit _; do
-      if [[ "$unit" == *splunk*.service || "$unit" == *Splunk*.service ]]; then
-        echo "--- $unit ---"
-        systemctl cat "$unit" 2>&1 || true
-        systemctl show "$unit" \
-          -p ExecStart -p ExecStartPre -p ExecStartPost -p ExecStop -p ExecStopPost \
-          -p FragmentPath -p DropInPaths 2>&1 || true
-      fi
-    done < <(systemctl list-unit-files --type=service --all --no-legend --no-pager 2>/dev/null)
-  } > "$dest/splunk-systemd-units.txt"
-  if [[ -x "$SPLUNK" ]]; then
-    for conf in inputs savedsearches commands alert_actions; do
-      "$SPLUNK" btool "$conf" list --debug \
-        > "$dest/splunk-${conf}.txt" 2>&1 \
-        || echo "WARNING: btool $conf could not be evaluated" >> "$dest/splunk-${conf}.txt"
-    done
-  else
-    echo 'Splunk binary not found' > "$dest/splunk-inputs.txt"
-    echo 'Splunk binary not found' > "$dest/splunk-savedsearches.txt"
-    echo 'Splunk binary not found' > "$dest/splunk-commands.txt"
-    echo 'Splunk binary not found' > "$dest/splunk-alert_actions.txt"
-  fi
-  getent group sudo > "$dest/sudo-group.txt" 2>&1 || true
-  date -u '+Snapshot timestamp: %Y-%m-%dT%H:%M:%SZ' > "$dest/readme.txt"
-}
-
-# Only copies files from these approved, primarily startup-related paths.
-# Sensitive account databases, vendor binaries, and arbitrary files are audited
-# by --check but are intentionally NOT automatically rolled back.
-restorable_path() {
-  case "$1" in
-    /etc/systemd/system/*|/etc/cron.d/*|/etc/cron.daily/*|/etc/cron.hourly/*|\
-    /etc/cron.weekly/*|/etc/cron.monthly/*|/etc/init.d/*|\
-    /var/spool/cron/crontabs/*|/etc/crontab|/etc/rc.local|\
-    /etc/ssh/sshd_config|/etc/ssh/sshd_config.d/*.conf|\
-    /etc/sudoers|/etc/sudoers.d/*|/etc/profile.d/*|\
-    /etc/udev/rules.d/*|/etc/network/if-up.d/*|/etc/network/if-pre-up.d/*|\
-    /usr/local/bin/*|/usr/local/sbin/*|/etc/ld.so.preload|\
-    /opt/splunk/etc/*|/opt/splunk/bin/scripts/*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-make_restorable_snapshot() {
-  local dest="$1" f size saved=0 skipped=0
-  mkdir -p "$dest/restorable/files"
-  : > "$dest/restorable/paths.nul"
-  : > "$dest/restorable/skipped.txt"
-  while IFS= read -r -d '' f; do
-    restorable_path "$f" || continue
-    [[ -f "$f" && ! -L "$f" ]] || continue
-    size="$(stat -c %s -- "$f" 2>/dev/null || printf 0)"
-    # Avoid snapshots of unexpectedly huge files; hash-only audit still covers them.
-    if ((size > 5 * 1024 * 1024)); then
-      printf 'Too large to copy (hash-only): %s\n' "$f" >> "$dest/restorable/skipped.txt"
-      skipped=$((skipped + 1))
-      continue
-    fi
-    mkdir -p -- "$dest/restorable/files$(dirname -- "$f")"
-    cp -p -- "$f" "$dest/restorable/files$f"
-    printf '%s\0' "$f" >> "$dest/restorable/paths.nul"
-    saved=$((saved + 1))
-  done < "$dest/file-paths.nul"
-  # Parent directories are private; keep original file modes (e.g. sudoers 0440).
-  chmod 0700 "$dest/restorable" "$dest/restorable/files"
-  echo "Restorable configuration files saved: $saved (oversized skipped: $skipped)"
-}
-
+if ((lab_approve)) && [[ -z "$lab_root" || "$mode" != --restore ]]; then
+ echo 'ERROR: --lab-approve permitted only with --restore --lab-root' >&2; exit 2
+fi
+# Recovery is intentionally restricted to the local NETLAB/VM console. A sudo
+# invocation may scrub SSH_* environment variables, so also trace parent processes.
 is_ssh_session() {
   [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]] && return 0
   local pid=$$ comm ppid hops=0
   while ((pid > 1 && hops < 40)); do
     comm="$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
-    case "$comm" in sshd|sshd-session) return 0 ;; esac
+    case "$comm" in sshd|sshd-session) return 0;; esac
     ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
     [[ "$ppid" =~ ^[0-9]+$ ]] || break
     pid="$ppid"
-    hops=$((hops + 1))
+    hops=$((hops+1))
   done
   return 1
 }
+if [[ "$mode" == --restore && -z "$lab_root" ]] && is_ssh_session; then
+  echo 'ERROR: Live restore requires NETLAB/VM console; SSH sessions are refused.' >&2
+  exit 2
+fi
+# Explicit trusted-relative inventory roots, deliberately excludes mutable Splunk var/lib logs and indexes.
+python3 - "$mode" "$root" "$state" "$dry" "$deep" "$lab_approve" "$profile" <<'PYTHON'
+import fcntl, hashlib, json, os, pathlib, re, shutil, stat, subprocess, sys, tempfile, time
 
-# Refuse to traverse symlinked path components when writing as root.
-no_symlink_components() {
-  local path="$1" item prefix=''
-  local -a parts
-  [[ "$path" == /* ]] || return 1
-  IFS='/' read -r -a parts <<< "${path#/}"
-  for item in "${parts[@]}"; do
-    [[ -n "$item" && "$item" != '.' && "$item" != '..' ]] || return 1
-    prefix+="/$item"
-    [[ ! -L "$prefix" ]] || return 1
-  done
-  return 0
-}
+mode, root, state, dry_s, deep_s, lab_approve_s, profile = sys.argv[1:]
+dry, deep, lab_approve = bool(int(dry_s)), bool(int(deep_s)), bool(int(lab_approve_s))
+lab = root != '/'
+paths = [
+ '/etc/systemd/system', '/etc/systemd/system.control', '/etc/systemd/system-generators',
+ '/etc/systemd/user', '/etc/systemd/user-generators',
+ '/etc/cron.d', '/etc/cron.daily', '/etc/cron.hourly', '/etc/cron.weekly', '/etc/cron.monthly',
+ '/etc/cron.yearly', '/etc/cron.allow', '/etc/cron.deny', '/etc/crontab',
+ '/etc/anacrontab', '/etc/logrotate.d', '/etc/update-motd.d',
+ '/var/spool/cron/crontabs', '/var/spool/cron/atjobs', '/etc/at.allow', '/etc/at.deny',
+ '/etc/init.d', '/etc/rc.local', '/etc/ssh', '/etc/sudoers', '/etc/sudoers.d',
+ '/etc/pam.d', '/etc/security', '/etc/profile', '/etc/bash.bashrc', '/etc/profile.d',
+ '/etc/login.defs', '/etc/environment', '/etc/environment.d', '/etc/polkit-1/rules.d',
+ '/etc/udev/rules.d', '/etc/network/if-up.d', '/etc/network/if-pre-up.d',
+ '/etc/NetworkManager/dispatcher.d', '/etc/network/interfaces', '/etc/network/interfaces.d',
+ '/etc/netplan', '/etc/modprobe.d', '/etc/modules-load.d',
+ '/etc/tmpfiles.d', '/etc/ld.so.preload', '/etc/ld.so.conf', '/etc/ld.so.conf.d',
+ '/etc/apt/apt.conf.d', '/etc/apt/sources.list', '/etc/apt/sources.list.d',
+ '/etc/sysctl.conf', '/etc/sysctl.d', '/etc/nftables.conf', '/etc/iptables', '/etc/ufw',
+ '/etc/fail2ban', '/etc/audit',
+ '/etc/passwd', '/etc/shadow', '/etc/group', '/etc/gshadow',
+ '/usr/local/bin', '/usr/local/sbin', '/usr/local/lib/systemd/system-generators',
+ '/usr/lib/systemd/system', '/usr/lib/systemd/system-generators',
+ '/usr/lib/systemd/user-generators',
+ '/lib/systemd/system', '/run/systemd/system', '/run/systemd/system.control',
+ '/run/systemd/system-generators',
+ '/run/systemd/generator', '/run/systemd/generator.early', '/run/systemd/generator.late',
+ '/opt/splunk/etc', '/opt/splunk/bin/scripts', '/root/.ssh',
+ '/root/.bashrc', '/root/.profile', '/root/.bash_profile', '/root/.config/systemd/user',
+]
+if profile == 'host':
+    paths = [path for path in paths if not path.startswith('/opt/splunk/')]
+# Files from ordinary user home .ssh tracked without crawling whole home trees.
+home_dir = os.path.join(root, 'home')
+if os.path.isdir(home_dir):
+    for n in sorted(os.listdir(home_dir)):
+        if n not in ('.', '..'):
+            for suffix in ('.ssh','.bashrc','.profile','.bash_profile','.config/systemd/user'):
+                paths.append('/home/' + n + '/' + suffix)
+MAX_COPY = 3 * 1024 * 1024
+MAX_TOTAL = 64 * 1024 * 1024
 
-# Config restoration never implies it is safe to restart Splunk or the VM.
-restore_baseline() {
-  [[ -f "$BASE/restorable/paths.nul" && -d "$BASE/restorable/files" ]] || {
-    echo 'ERROR: This baseline has hashes only; it has no restorable file contents.' >&2
-    echo 'Create a NEW baseline on a verified clean VM using this updated script.' >&2
-    return 2
-  }
-  if is_ssh_session; then
-    echo 'ERROR: Restore requires the NETLAB/VM local console, not SSH.' >&2
-    return 2
-  fi
-  local f original mode_orig mode_current
-  local -a changed=() unsafe=()
-  # Also report previously unknown startup-related files: restoring known files
-  # alone does NOT neutralize newly installed persistence.
-  mkdir -p "$REPORT_ROOT"
-  chmod 0700 "$REPORT_ROOT"
-  local audit
-  audit="$(mktemp -d "$REPORT_ROOT/restore-preview-XXXXXXXX")"
-  capture "$audit"
-  local -A baseline_seen=()
-  local new_count=0
-  if [[ -f "$BASE/file-paths.nul" ]]; then
-    while IFS= read -r -d '' f; do baseline_seen["$f"]=1; done < "$BASE/file-paths.nul"
-  fi
-  echo '=== NEW STARTUP / CONFIG FILES SINCE BASELINE ==='
-  : > "$audit/new-files.txt"
-  while IFS= read -r -d '' f; do
-    if [[ ! -v baseline_seen["$f"] ]]; then
-      printf 'REVIEW NEW | %s\n' "$f" >> "$audit/new-files.txt"
-      if ((new_count < 20)); then printf 'REVIEW NEW | %s\n' "$f"; fi
-      new_count=$((new_count + 1))
-    fi
-  done < "$audit/file-paths.nul"
-  printf 'New files requiring review: %d\n' "$new_count"
-  if ((new_count > 20)); then echo "Full list: $audit/new-files.txt"; fi
-  if ! cmp -s "$BASE/symlink-targets.txt" "$audit/symlink-targets.txt"; then
-    echo 'REVIEW | Startup/configuration symlink changes detected.'
-    echo "         Compare: diff -u '$BASE/symlink-targets.txt' '$audit/symlink-targets.txt'"
-  fi
-  if ! cmp -s "$BASE/enabled-services.txt" "$audit/enabled-services.txt"; then
-    echo 'REVIEW | Enabled systemd services differ from baseline.'
-  fi
-  while IFS= read -r -d '' f; do
-    restorable_path "$f" || { unsafe+=("$f"); continue; }
-    original="$BASE/restorable/files$f"
-    if [[ ! -f "$original" || -L "$original" ]] || ! no_symlink_components "$f"; then
-      unsafe+=("$f")
-      continue
-    fi
-    mode_orig="$(stat -c '%a:%u:%g' -- "$original" 2>/dev/null || true)"
-    mode_current="$(stat -c '%a:%u:%g' -- "$f" 2>/dev/null || true)"
-    if [[ ! -f "$f" ]] || ! cmp -s -- "$original" "$f" || [[ "$mode_orig" != "$mode_current" ]]; then
-      changed+=("$f")
-    fi
-  done < "$BASE/restorable/paths.nul"
+def actual(rel): return os.path.join(root, rel.lstrip('/'))
+def sha(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''): h.update(chunk)
+    return h.hexdigest()
 
-  printf '\n=== BASELINE RESTORE PREVIEW (no changes yet) ===\n'
-  printf 'Baselined files requiring restoration: %d\n' "${#changed[@]}"
-  for f in "${changed[@]}"; do printf 'RESTORE | %s\n' "$f"; done
-  for f in "${unsafe[@]}"; do printf 'SKIP UNSAFE | %s\n' "$f"; done
-  echo 'NOT INCLUDED: account databases, vendor-managed service files, runtime UFW state.'
-  echo 'NOT REMOVED: newly added scripts, files, services, timers, or symlinks.'
-  echo 'IMPORTANT: Inspect added persistence entries and modified privileged accounts.'
-  echo 'No service restarts/reloads or automatic account changes are performed.'
-  if [[ ${2:-} == --dry-run ]]; then echo 'DRY RUN: no files changed.'; return 0; fi
-  if ((${#changed[@]} == 0)); then
-    echo 'Nothing to restore from the saved file copies.'
-    return 0
-  fi
+def is_sensitive(rel):
+    p = rel.lower()
+    if rel in ('/etc/passwd','/etc/shadow','/etc/group','/etc/gshadow'): return True
+    if rel.startswith(('/root/.ssh/','/home/')) and '/.ssh/' in p: return True
+    if p.startswith('/etc/ssh/ssh_host_'): return True
+    if p == '/opt/splunk/etc/passwd' or p.endswith('/splunk.secret'): return True
+    if p.endswith(('.pem','.key','.p12','.pfx','.crt')): return True
+    return False
 
-  local answer
-  read -r -p 'Type RESTORE BASELINE to overwrite those files: ' answer || true
-  if [[ "$answer" != 'RESTORE BASELINE' ]]; then
-    echo 'CANCELLED: no files changed.'
-    return 0
-  fi
+def can_restore(rel):
+    # High-risk identity and secret files remain audit-only. No restoration of vendor binaries.
+    if is_sensitive(rel): return False
+    pref = ('/etc/systemd/system/', '/etc/cron.', '/etc/init.d/',
+            '/var/spool/cron/crontabs/', '/etc/ssh/sshd_config',
+            '/etc/sudoers', '/etc/profile.d/', '/etc/udev/rules.d/',
+            '/etc/network/if-', '/usr/local/bin/', '/usr/local/sbin/',
+            '/opt/splunk/etc/system/local/', '/opt/splunk/etc/apps/',
+            '/opt/splunk/bin/scripts/')
+    return rel in ('/etc/crontab','/etc/rc.local','/etc/profile','/etc/bash.bashrc',
+                   '/etc/ld.so.preload') or rel.startswith(pref)
 
-  mkdir -p "$REPORT_ROOT"
-  chmod 0700 "$REPORT_ROOT"
-  local rollback count=0 failed=0 dest parent tmp
-  rollback="$(mktemp -d "$REPORT_ROOT/pre-restore-XXXXXXXX")"
-  mkdir -p "$rollback/before"
-  chmod 0700 "$rollback" "$rollback/before"
-  printf 'Pre-restore copies, when existing, live under before/; read report.txt.\n' > "$rollback/report.txt"
-  for f in "${changed[@]}"; do
-    original="$BASE/restorable/files$f"
-    if ! no_symlink_components "$f" || [[ ! -f "$original" || -L "$original" ]]; then
-      printf 'FAIL | Unsafe or missing baseline file: %s\n' "$f" | tee -a "$rollback/report.txt"
-      failed=$((failed + 1))
-      continue
-    fi
-    parent="$(dirname -- "$f")"
-    # Do not create arbitrary parent dirs that might have been removed/hijacked.
-    if [[ ! -d "$parent" ]]; then
-      printf 'FAIL | Parent directory missing: %s\n' "$f" | tee -a "$rollback/report.txt"
-      failed=$((failed + 1))
-      continue
-    fi
-    if [[ -e "$f" ]]; then
-      mkdir -p "$rollback/before$parent"
-      if ! cp -p -- "$f" "$rollback/before$f"; then
-        printf 'FAIL | Could not preserve current version: %s\n' "$f" | tee -a "$rollback/report.txt"
-        failed=$((failed + 1)); continue
-      fi
-    fi
-    # Create temp in same destination directory; atomically replace final file.
-    tmp="$(mktemp "$parent/.ccdc-restore-XXXXXXXX")" || { failed=$((failed + 1)); continue; }
-    if cp -p -- "$original" "$tmp" && mv -fT -- "$tmp" "$f"; then
-      if cmp -s -- "$original" "$f" && \
-        [[ "$(stat -c '%a:%u:%g' -- "$original")" == "$(stat -c '%a:%u:%g' -- "$f")" ]]; then
-        printf 'PASS | Restored: %s\n' "$f" | tee -a "$rollback/report.txt"
-        count=$((count + 1))
-      else
-        printf 'FAIL | Post-restore mismatch: %s\n' "$f" | tee -a "$rollback/report.txt"
-        failed=$((failed + 1))
-      fi
-    else
-      rm -f -- "$tmp"
-      printf 'FAIL | Could not restore: %s\n' "$f" | tee -a "$rollback/report.txt"
-      failed=$((failed + 1))
-    fi
-  done
-  printf '\nRestored: %d | Failed: %d | Pre-restore copies: %s\n' "$count" "$failed" "$rollback"
-  if command -v visudo >/dev/null 2>&1; then
-    visudo -c >/dev/null 2>&1 && echo 'PASS | sudoers syntax' || echo 'WARN | sudoers syntax check failed'
-  fi
-  if [[ -x /usr/sbin/sshd ]]; then
-    /usr/sbin/sshd -t && echo 'PASS | OpenSSH configuration syntax' || echo 'WARN | OpenSSH configuration syntax check failed'
-  fi
-  echo 'REVIEW REQUIRED: Recheck changed systemd units, cron, Splunk scripted inputs,'
-  echo 'new files/symlinks and sudo accounts before any reboot or Splunk restart.'
-  echo 'Restored configuration is NOT automatically activated. It does NOT prove the host is clean.'
-  ((failed == 0))
-}
+def inspect(rel):
+    p = actual(rel)
+    s = os.lstat(p)
+    if stat.S_ISREG(s.st_mode):
+        typ, val = 'file', sha(p)
+    elif stat.S_ISLNK(s.st_mode):
+        typ, val = 'symlink', os.readlink(p)
+    elif stat.S_ISDIR(s.st_mode):
+        typ, val = 'dir', ''
+    else:
+        typ, val = 'special', ''
+    return {'path':rel, 'type':typ, 'mode':stat.S_IMODE(s.st_mode),
+            'uid':s.st_uid, 'gid':s.st_gid, 'size':s.st_size if typ=='file' else 0, 'value':val}
 
-case "$1" in
-  --baseline)
-    if [[ -e "$BASE" ]]; then
-      echo "ERROR: Baseline exists at $BASE. Refusing to overwrite it." >&2
-      exit 2
-    fi
-    mkdir -p "$BASE"
-    chmod 0700 "$BASE"
-    capture "$BASE"
-    make_restorable_snapshot "$BASE"
-    echo "BASELINE CREATED: $BASE"
-    echo 'Only do this after a trusted build and manual verification.'
-    ;;
-  --restore)
-    [[ -d "$BASE" ]] || { echo "ERROR: No baseline at $BASE." >&2; exit 2; }
-    restore_baseline "$@"
-    ;;
-  --check)
-    [[ -d "$BASE" ]] || { echo "ERROR: No baseline at $BASE. Create one first." >&2; exit 2; }
-    mkdir -p "$REPORT_ROOT"
-    chmod 0700 "$REPORT_ROOT"
-    REPORT="$(mktemp -d "$REPORT_ROOT/scan-XXXXXXXX")"
-    capture "$REPORT"
-    echo "Current-state audit: $REPORT"
-    echo '==== BASELINE DIFFERENCES ===='
-    changed=0
-    for name in file-hashes.txt file-permissions.txt symlink-targets.txt enabled-services.txt \
-                timer-units.txt user-crontabs.txt at-jobs.txt splunk-systemd-units.txt \
-                splunk-inputs.txt splunk-savedsearches.txt splunk-commands.txt \
-                splunk-alert_actions.txt sudo-group.txt ufw-status.txt; do
-      if diff -u "$BASE/$name" "$REPORT/$name" > "$REPORT/diff-${name}"; then
-        printf 'UNCHANGED | %s\n' "$name"
-      else
-        printf 'REVIEW    | %s (see diff-%s)\n' "$name" "$name"
-        changed=$((changed + 1))
-      fi
-    done
-    echo "Total categories needing review: $changed"
-    echo 'A changed file is NOT automatically malicious; review each difference.'
-    echo 'Live listening sockets and timer schedule are saved but not compared (transient).'
-    ;;
-  *) usage; exit 2 ;;
-esac
+def inventory():
+    found = {}
+    errors = []
+    for rel in paths:
+        target = actual(rel)
+        if not os.path.lexists(target): continue
+        try:
+            # Inventory the root itself; don't follow directory symlinks.
+            if rel not in found: found[rel] = inspect(rel)
+            if not os.path.isdir(target) or os.path.islink(target): continue
+            def err(exc): errors.append(f'{rel}: {exc}')
+            for base, dirs, files in os.walk(target, topdown=True, followlinks=False, onerror=err):
+                for name in dirs + files:
+                    p = os.path.join(base, name)
+                    logical = '/' + os.path.relpath(p, root).replace(os.sep, '/')
+                    if logical not in found:
+                        try: found[logical] = inspect(logical)
+                        except (OSError, ValueError) as exc: errors.append(f'{logical!r}: {exc}')
+        except (OSError, ValueError) as exc: errors.append(f'{rel!r}: {exc}')
+    if errors:
+        raise RuntimeError('Incomplete inventory; refusing to call state clean. Examples: ' + '; '.join(errors[:8]))
+    return found
+
+def write_json(path, obj):
+    with open(path,'w',encoding='utf8') as fh:
+        json.dump(obj,fh,sort_keys=True,indent=2,ensure_ascii=True)
+        fh.write('\n')
+        fh.flush(); os.fsync(fh.fileno())
+    os.chmod(path,0o600)
+
+def read_json(path):
+    with open(path,encoding='utf8') as fh: return json.load(fh)
+
+def diff_inventory(before, now):
+    out=[]
+    for rel in sorted(set(before) | set(now)):
+        old, new = before.get(rel), now.get(rel)
+        if not old: what='ADDED'
+        elif not new: what='MISSING'
+        elif any(old[k] != new[k] for k in ('type','mode','uid','gid','size','value')): what='MODIFIED'
+        else: continue
+        delta=[] if not (old and new) else [k for k in ('type','mode','uid','gid','size','value') if old[k]!=new[k]]
+        out.append({'path':rel,'status':what,'attributes':delta,'restorable':what != 'ADDED' and
+                    bool(old and old.get('copy')) and (not new or new['type']=='file')})
+    return out
+
+def diagnostics(report):
+    if lab: return
+    commands = {
+        'ports.txt':['ss','-H','-lntup'],
+        'systemd-services.txt':['systemctl','list-units','--type=service','--all','--no-pager','--no-legend'],
+        'systemd-timers.txt':['systemctl','list-timers','--all','--no-pager'],
+        'systemd-unit-files.txt':['systemctl','list-unit-files','--all','--no-pager'],
+        'network-addresses.txt':['ip','-br','addr'],
+        'ufw.txt':['ufw','status','verbose'],
+        'splunk-btool-check.txt':['/opt/splunk/bin/splunk','btool','check'],
+    }
+    if deep: commands['dpkg-verify.txt']=['dpkg','--verify']
+    for name,argv in commands.items():
+        dest=os.path.join(report,name)
+        try:
+            cp=subprocess.run(argv,capture_output=True,text=True,timeout=15 if name != 'dpkg-verify.txt' else 120)
+            msg=f'exit_status={cp.returncode}\n'+cp.stdout[:2_000_000]+cp.stderr[:500_000]
+        except (OSError,subprocess.TimeoutExpired) as exc:
+            msg=f'UNAVAILABLE: {exc}\n'
+        with open(dest,'w') as f: f.write(msg)
+        os.chmod(dest,0o600)
+
+def report_dir():
+    base=os.path.join(state,'reports')
+    os.makedirs(base,mode=0o700,exist_ok=True)
+    return tempfile.mkdtemp(prefix='scan-',dir=base)
+
+def check_safe_parent(file):
+    # Refuse any symlink component (including destination) before root write.
+    cur=root
+    for part in file.lstrip('/').split('/'):
+        if not part or part in ('.','..'): return False
+        cur=os.path.join(cur,part)
+        if os.path.islink(cur): return False
+    return True
+
+def make_baseline():
+    if os.path.lexists(state): raise RuntimeError(f'Baseline already exists: {state}')
+    parent=os.path.dirname(state)
+    os.makedirs(parent,mode=0o700,exist_ok=True)
+    if os.path.islink(parent): raise RuntimeError('Symlinked baseline parent refused')
+    stage=tempfile.mkdtemp(prefix='.ccdc-stage-',dir=parent)
+    try:
+        os.chmod(stage,0o700)
+        os.mkdir(os.path.join(stage,'objects'),0o700)
+        now=inventory()
+        copied=0; skipped=[]
+        for rel,item in sorted(now.items()):
+            if item['type'] != 'file' or not can_restore(rel): continue
+            if item['size'] > MAX_COPY or copied + item['size'] > MAX_TOTAL:
+                skipped.append({'path':rel,'reason':'size budget exceeded'}); continue
+            target=os.path.join(stage,'objects',item['value'])
+            if not os.path.exists(target):
+                # copying from a source may race live changes; compare copied hash.
+                shutil.copyfile(actual(rel),target,follow_symlinks=False)
+                os.chmod(target,0o600)
+                if sha(target) != item['value']:
+                    raise RuntimeError(f'Source changed during snapshot: {rel!r}')
+                copied += item['size']
+            item['copy']=item['value']
+        write_json(os.path.join(stage,'manifest.json'), {'version':2,'created_utc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'root':root,'profile':profile,'files':now,'skipped':skipped})
+        os.rename(stage,state)
+        print(f'BASELINE CREATED: {state} | inventory {len(now)} | restorable {sum(bool(x.get("copy")) for x in now.values())} | skipped {len(skipped)} | copy bytes {copied}')
+        print('Do NOT create this baseline unless the guest is believed trusted. CCDC snapshots stay ON THIS GUEST; root compromise can tamper with them.')
+        return 0
+    except Exception:
+        shutil.rmtree(stage,ignore_errors=True)
+        raise
+
+def check_or_restore():
+    manifest=read_json(os.path.join(state,'manifest.json'))
+    if manifest.get('version')!=2 or manifest.get('root')!=root or manifest.get('profile')!=profile: raise RuntimeError('Baseline format/root mismatch')
+    before=manifest['files']
+    for rel,entry in before.items():
+        if entry.get('copy'):
+            digest=entry['copy']
+            if not re.fullmatch(r'[0-9a-f]{64}',digest): raise RuntimeError('Invalid object hash in baseline')
+            obj=os.path.join(state,'objects',digest)
+            if not os.path.isfile(obj) or sha(obj)!=digest:
+                raise RuntimeError(f'Baseline copy missing/corrupt for {rel!r}; refusing restore/check')
+    now=inventory()
+    diff=diff_inventory(before,now)
+    report=report_dir()
+    write_json(os.path.join(report,'differences.json'),diff)
+    with open(os.path.join(report,'changes.txt'),'w') as out:
+        for d in diff:
+            row=f"{d['status']:8} {d['path']!r} {','.join(d['attributes'])} restorable={d['restorable']}"
+            print(row,file=out)
+    diagnostics(report)
+    added=sum(x['status']=='ADDED' for x in diff)
+    missing=sum(x['status']=='MISSING' for x in diff)
+    modified=sum(x['status']=='MODIFIED' for x in diff)
+    print(f'DIFFERENCES: added={added}, missing={missing}, modified={modified}. REPORT: {report}')
+    for d in diff[:60]: print(f"{d['status']:8} {d['path']!r} {','.join(d['attributes'])}")
+    if len(diff)>60: print(f'... {len(diff)-60} more in {report}/changes.txt')
+    if mode=='--check':
+        print('Note: clean inventory does NOT prove clean runtime, valid scored services, or trusted root.')
+        return 1 if diff else 0
+    candidates=[d for d in diff if d['restorable']]
+    print('Restore never removes new files, restarts services, resets accounts or changes runtime firewall rules.')
+    if not candidates:
+        print('No backed-up files eligible for restoration. Examine added files/identities separately.')
+        return 1 if diff else 0
+    for i,d in enumerate(candidates,1): print(f'  [{i}] {d["path"]!r}')
+    if dry:
+        print('DRY-RUN: no writes. A nonzero exit indicates differences remain.')
+        return 1
+    if lab_approve: chosen=candidates
+    else:
+        # The Bash process feeds this Python source through stdin; console input must use /dev/tty.
+        try:
+            with open('/dev/tty','r+') as tty:
+                tty.write('Select restore numbers comma-separated, ALL, or Enter to cancel: '); tty.flush()
+                choice=tty.readline().strip()
+                if choice=='ALL': chosen=candidates
+                else:
+                    selected={int(x) for x in choice.split(',') if x.strip().isdigit()}
+                    chosen=[d for i,d in enumerate(candidates,1) if i in selected]
+                if not chosen:
+                    print('CANCELLED'); return 1
+                tty.write(f'Type RESTORE {len(chosen)} to confirm: '); tty.flush()
+                if tty.readline().strip()!=f'RESTORE {len(chosen)}':
+                    print('CANCELLED'); return 1
+        except OSError as exc: raise RuntimeError(f'Interactive console required: {exc}')
+    rollback=os.path.join(report,'pre-restore')
+    os.mkdir(rollback,0o700)
+    ok=0; failures=0
+    for d in chosen:
+        rel=d['path']; old=before[rel]; dest=actual(rel)
+        try:
+            if not check_safe_parent(rel): raise RuntimeError('symlinked path component')
+            parent=os.path.dirname(dest)
+            if not os.path.isdir(parent): raise RuntimeError('parent missing/not directory')
+            if os.path.lexists(dest) and not os.path.isfile(dest): raise RuntimeError('destination no longer a regular file')
+            # Recheck that source is unchanged since the preview; no silent clobber.
+            if now.get(rel) != (inspect(rel) if os.path.lexists(dest) else None):
+                raise RuntimeError('destination changed since preview')
+            digest=old['copy']
+            source=os.path.join(state,'objects',digest)
+            if sha(source)!=digest: raise RuntimeError('baseline copy hash mismatch')
+            if os.path.isfile(dest):
+                before_path=os.path.join(rollback,f'{len(os.listdir(rollback)):06d}.before')
+                shutil.copy2(dest,before_path,follow_symlinks=False)
+                os.chmod(before_path,0o600)
+                with open(before_path+'.path','w') as f: f.write(rel)
+            fd,tmp=tempfile.mkstemp(prefix='.ccdc-restore-',dir=parent)
+            try:
+                with os.fdopen(fd,'wb') as output, open(source,'rb') as sf: shutil.copyfileobj(sf,output)
+                os.chown(tmp,old['uid'],old['gid'])
+                os.chmod(tmp,old['mode'])
+                if sha(tmp)!=digest: raise RuntimeError('staged file failed hash check')
+                if not check_safe_parent(rel): raise RuntimeError('symlink changed during staging')
+                os.replace(tmp,dest)
+            finally:
+                if os.path.exists(tmp): os.unlink(tmp)
+            print(f'RESTORED {rel!r}')
+            ok += 1
+        except Exception as exc:
+            print(f'FAILED {rel!r}: {exc}',file=sys.stderr)
+            failures+=1
+    print(f'RESTORE SUMMARY: ok={ok} failed={failures} | rollback folder={rollback}')
+    if not lab:
+        print('DO NOT restart Splunk without first reviewing new persistence, running syntax checks, and checking scoring.')
+        print('Suggested checks: visudo -c ; /usr/sbin/sshd -t ; /opt/splunk/bin/splunk btool check')
+    after=diff_inventory(before,inventory())
+    write_json(os.path.join(report,'post-restore-differences.json'),after)
+    print(f'POST-RESTORE DIFFERENCES REMAINING: {len(after)} (see post-restore-differences.json)')
+    return 2 if failures else (1 if after else 0)
+
+try:
+    # Serialize concurrent invocations to avoid accidental overlapping baseline/report operations.
+    lock_fd=os.open(state+'.lock',os.O_CREAT|os.O_RDWR|getattr(os,'O_NOFOLLOW',0),0o600)
+    fcntl.flock(lock_fd,fcntl.LOCK_EX)
+    if os.path.islink(state): raise RuntimeError('Symlinked state directory refused')
+    if mode == '--baseline':
+        status=make_baseline()
+    elif not os.path.isfile(os.path.join(state,'manifest.json')):
+        raise RuntimeError(f'No completed baseline manifest found: {state}')
+    else:
+        status=check_or_restore()
+except Exception as ex:
+    print(f'ERROR: {ex}',file=sys.stderr)
+    status=2
+sys.exit(status)
+PYTHON
