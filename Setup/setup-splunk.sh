@@ -22,6 +22,7 @@ CCDC_CHANGED_SPLUNK=0
 CCDC_CHANGED_INPUTS=0
 CCDC_RESTARTED=0
 CCDC_UFW_APPLIED=0
+CCDC_IPV6_UFW_SET=0
 # Verification-only bookkeeping for operations performed in this invocation.
 CCDC_ROOT_PASSWORD_CHANGED=0
 CCDC_ROOT_PASSWORD_REQUESTED=0
@@ -30,11 +31,46 @@ CCDC_SURICATA_REQUESTED=0
 CCDC_SPLUNK_RESTART_REQUESTED=0
 CCDC_EXPIRED_ACCOUNTS=()
 CCDC_SPLUNK_CREDENTIALS_BEFORE=''
+CCDC_ANALYST_CREATED=0
+CCDC_ANALYST_CREDENTIALS_AFTER=''
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN | %s\n' "$*" >&2; }
 fail() { printf 'FAIL | %s\n' "$*" >&2; CCDC_SETUP_ERRORS=$((CCDC_SETUP_ERRORS+1)); }
 yesno() { local answer=''; read -r -p "$1 [y/N]: " answer || true; [[ "$answer" =~ ^[Yy]$ ]]; }
+
+# Run a reviewed security helper, downloaded from a specific GitHub ref or
+# copied from a local offline checkout. Use a pinned commit in CCDC_REPO_REF
+# after validating the final script set. No script is executed on download error.
+ccdc_run_github_helper() {
+    local interpreter="$1" relative="$2" temp='' url='' rc=0
+    shift 2
+    case "$interpreter" in bash|python3) ;; *) warn "Unsupported helper: $interpreter"; return 2 ;; esac
+    temp="$(mktemp /root/ccdc-helper.XXXXXXXX)" || return 1
+    if [[ -n "${CCDC_OFFLINE_ROOT:-}" ]]; then
+        if ! cp -- "${CCDC_OFFLINE_ROOT%/}/$relative" "$temp"; then
+            warn "Offline helper missing: $relative"
+            rm -f -- "$temp"; return 1
+        fi
+    else
+        if ! command -v wget >/dev/null 2>&1; then
+            warn 'wget unavailable for helper download'
+            rm -f -- "$temp"; return 1
+        fi
+        url="https://raw.githubusercontent.com/Moses-Strom/CCDC-temp/${CCDC_REPO_REF:-main}/$relative"
+        if ! wget --https-only -q --tries=2 --timeout=20 -O "$temp" "$url"; then
+            warn "Failed downloading $relative"
+            rm -f -- "$temp"; return 1
+        fi
+    fi
+    if [[ ! -s "$temp" ]]; then warn "Downloaded helper empty: $relative";rm -f -- "$temp";return 1;fi
+    if [[ "$interpreter" == bash ]]; then
+        if ! bash -n "$temp"; then warn "Invalid Bash syntax: $relative";rm -f -- "$temp";return 1;fi
+    fi
+    if "$interpreter" "$temp" "$@"; then rc=0; else rc=$?; fi
+    rm -f -- "$temp"
+    return "$rc"
+}
 
 ccdc_ssh_session() {
     [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]] && return 0
@@ -363,6 +399,68 @@ ccdc_configure_firewall() {
     CCDC_UFW_APPLIED=1
     say 'PASS | UFW active: deny incoming; allow outgoing; required inbound TCP ports allowed.'
     say 'Verify remote scoring, forwarding and ping from other CCDC machines.'
+}
+
+# Optional UFW IPv6 restriction. Requires active UFW; preserves existing IPv4 rules.
+# UFW's IPV6=no filters non-loopback IPv6 traffic in both directions while UFW is active.
+ccdc_optional_ufw_ipv6_block() {
+    if ! yesno 'Block non-loopback IPv6 with UFW? (may block inbound AND outbound IPv6)'; then
+        say 'SKIP | IPv6 block not selected'
+        return 0
+    fi
+    if ccdc_ssh_session; then warn 'IPv6 change requires local VM console'; return 1; fi
+    if ! command -v ufw >/dev/null 2>&1 ||
+       ! LC_ALL=C ufw status 2>/dev/null | grep -Eq '^Status: active$'; then
+        warn 'UFW not active; refusing to change IPv6 or activate firewall automatically'
+        return 1
+    fi
+    if [[ ! -f /etc/default/ufw || -L /etc/default/ufw ]]; then
+        warn 'Expected regular /etc/default/ufw file not found; no changes made'
+        return 1
+    fi
+    local matches backup confirm=''
+    matches="$(grep -Ec '^[[:space:]]*IPV6[[:space:]]*=' /etc/default/ufw || true)"
+    if [[ "$matches" != 1 ]]; then
+        warn "Expected one IPV6= setting in /etc/default/ufw, found $matches"
+        return 1
+    fi
+    say 'IPv6 global addresses:'; ip -6 addr show scope global || true
+    say 'IPv6 default routes:'; ip -6 route show default || true
+    say 'Confirm DNS, monitoring and scoring do not use IPv6 before proceeding.'
+    read -r -p 'Type BLOCK-IPV6 to confirm: ' confirm || true
+    if [[ "$confirm" != BLOCK-IPV6 ]]; then
+        say 'SKIP | IPv6 block not confirmed'
+        return 0
+    fi
+    if grep -Eq '^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*no[[:space:]]*$' /etc/default/ufw; then
+        say 'PASS | UFW already configured IPV6=no'
+        CCDC_IPV6_UFW_SET=1
+        return 0
+    fi
+    backup="/root/ccdc-ufw-before-ipv6.$(date +%Y%m%d-%H%M%S).$$"
+    cp -p -- /etc/default/ufw "$backup" || { warn 'IPv6 config backup failed';return 1; }
+    if ! python3 - /etc/default/ufw <<'PY_UFW_IPV6'
+from pathlib import Path
+import re, sys
+p=Path(sys.argv[1]); s=p.read_text()
+s,n=re.subn(r'(?m)^[ \t]*IPV6[ \t]*=.*$', 'IPV6=no', s)
+if n != 1: raise SystemExit('Unexpected IPV6 setting count')
+p.write_text(s)
+PY_UFW_IPV6
+    then
+        cp -p -- "$backup" /etc/default/ufw || true
+        warn 'Could not set IPV6=no; restored backup'
+        return 1
+    fi
+    if ! ufw reload; then
+        warn 'UFW reload failed; restoring backup and attempting reload'
+        cp -p -- "$backup" /etc/default/ufw || true
+        ufw reload || warn 'Rollback reload also failed; inspect via console'
+        return 1
+    fi
+    CCDC_IPV6_UFW_SET=1
+    say "PASS | UFW IPV6=no; backup $backup"
+    say 'INFO | Verify scoring and host IPv6 reachability externally; a config check alone cannot prove filtering.'
 }
 
 ccdc_apply_ssh_restriction() {
@@ -699,7 +797,7 @@ for i,line in enumerate(lines):
     if in_af:
         m=re.match(r'^(\s*-\s*interface:\s*)([^\s#]+)(.*)$',line)
         if m:
-            lines[i]=m.group(1)+iface+m.group(3)
+            lines[i]=m.group(1)+iface+m.group(3)+("\n" if line.endswith("\n") else "")
             changed=True
             break
 if not changed: raise SystemExit('ERROR: cannot locate AF_PACKET interface in YAML')
@@ -733,7 +831,7 @@ EOF_SUR_UNIT
         cp -p "$yaml_backup" "$config"
         return 1
     fi
-    if grep -Eqi '0 (rules|signatures) (successfully )?loaded|0 signatures processed' /var/log/suricata/ccdc-config-test.log; then
+    if grep -Eqi '(^|[^0-9])0 (rules|signatures) (successfully )?loaded|(^|[^0-9])0 signatures processed' /var/log/suricata/ccdc-config-test.log; then
         warn 'Suricata reported zero loaded signatures; IDS detection is not ready.'
         return 1
     fi
@@ -844,7 +942,15 @@ ccdc_verification() {
        [[ "$(ccdc_account_expiry root)" != expired ]]; then
         say 'PASS | Linux root account exists and is not expired'
     else say 'FAIL | Linux root account missing or expired'; failed=1; fi
-    if [[ -n "$CCDC_SPLUNK_CREDENTIALS_BEFORE" ]]; then
+    if [[ "$CCDC_ANALYST_CREATED" -eq 1 ]]; then
+        credential_now="$(sha256sum "$SPLUNK_HOME/etc/passwd" 2>/dev/null | awk '{print $1}' || true)"
+        if [[ -n "$CCDC_ANALYST_CREDENTIALS_AFTER" && "$credential_now" == "$CCDC_ANALYST_CREDENTIALS_AFTER" ]]; then
+            say 'REVIEW | Splunk credential store updated by approved analyst creation; verify admin login and analyst permissions'
+        else
+            say 'FAIL | Splunk credential store changed after approved analyst creation or is unreadable'
+            failed=1
+        fi
+    elif [[ -n "$CCDC_SPLUNK_CREDENTIALS_BEFORE" ]]; then
         credential_now="$(sha256sum "$SPLUNK_HOME/etc/passwd" 2>/dev/null | awk '{print $1}' || true)"
         if [[ -n "$credential_now" && "$credential_now" == "$CCDC_SPLUNK_CREDENTIALS_BEFORE" ]]; then
             say 'PASS | Splunk credential store unchanged during this setup run'
@@ -953,6 +1059,17 @@ ccdc_verification() {
         else say 'PASS | No additional UFW user inbound ALLOW rules found'; fi
     else say 'FAIL | UFW not installed'; failed=1; fi
 
+    if [[ "$CCDC_IPV6_UFW_SET" -eq 1 ]]; then
+        if grep -Eq '^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*no[[:space:]]*$' /etc/default/ufw 2>/dev/null &&
+           LC_ALL=C ufw status 2>/dev/null | grep -Eq '^Status: active$'; then
+            say 'PASS | UFW active and configured IPV6=no (external reachability not tested)'
+        else
+            say 'FAIL | Requested UFW IPv6 block not confirmed';failed=1
+        fi
+    elif [[ -f /etc/default/ufw ]]; then
+        say 'INFO | UFW IPv6 configuration was not changed by this invocation'
+    fi
+
     if [[ "${1:-}" == final && "$CCDC_CLAMAV_REQUESTED" -eq 0 && ! -f /etc/clamav/clamd.conf ]]; then
         say 'SKIP | ClamAV not selected and not installed'
     elif [[ -f /etc/clamav/clamd.conf ]] || command -v clamonacc >/dev/null 2>&1; then
@@ -1047,6 +1164,17 @@ if ccdc_ssh_session; then
     exit 3
 fi
 
+# Optional pre-setup inspection before dashboard execution, firewall or auth edits.
+if yesno 'Run read-only security audit before changing this host?'; then
+    if ! ccdc_run_github_helper bash Setup/ccdc-readonly-security-audit.sh --pre-restart; then
+        warn 'Pre-setup security audit failed or is unavailable.'
+        if ! yesno 'Continue setup despite the audit failure?'; then
+            say 'STOP | Review audit failure before continuing.'
+            exit 1
+        fi
+    fi
+fi
+
 # Set credential baseline before invoking the dashboard installer.
 if [[ -f "$SPLUNK_HOME/etc/passwd" ]] && command -v sha256sum >/dev/null 2>&1; then
     CCDC_SPLUNK_CREDENTIALS_BEFORE="$(sha256sum "$SPLUNK_HOME/etc/passwd" | awk '{print $1}')"
@@ -1099,10 +1227,21 @@ ccdc_configure_lockout || fail 'Splunk lockout setup failed'
 ccdc_apply_ssh_restriction || fail 'SSH restriction failed'
 ccdc_block_ssh_elevation || fail 'SSH sudo/su elevation restriction failed'
 ccdc_configure_firewall || fail 'UFW configuration failed'
+ccdc_optional_ufw_ipv6_block || fail 'Optional UFW IPv6 change failed'
 
 # Pre-configure Splunk monitoring inputs before restarting, even if optional
 # IDS/AV logs do not exist yet. Refresh their ACLs after optional installs.
 ccdc_setup_monitoring_input || fail 'Splunk AV/IDS input setup failed'
+
+# Optional vendor workaround for vulnerable Splunk PostgreSQL sidecar.
+# Helper edits server.conf only when confirmed; intended early restart follows.
+if yesno 'Review/apply PostgreSQL sidecar mitigation before Splunk restart?'; then
+    if ccdc_run_github_helper bash Setup/ccdc-mitigate-postgres.sh --apply; then
+        say 'PASS | Sidecar mitigation helper completed'
+    else
+        fail 'Sidecar mitigation failed or was declined; review exposure and dependency requirements'
+    fi
+fi
 
 # ==========================================================
 # Restart NOW, before slower apt upgrades, ClamAV and Suricata downloads.
@@ -1124,43 +1263,58 @@ else
 fi
 
 # ==========================================================
-# Create Splunk Analyst Account
+# OPTIONAL Splunk Analyst Account
+# Use the revised create-or-verify Python helper for repeatable setups.
+# Existing analyst roles/users are inspected, never overwritten automatically.
 # ==========================================================
-
-echo "=== Setting Up Splunk Analyst Account ==="
-
-ANALYST_URL="https://raw.githubusercontent.com/Moses-Strom/CCDC-temp/refs/heads/main/Dashboards/create-splunk-analyst.py"
-
-ANALYST_SCRIPT="$(mktemp /tmp/ccdc-analyst.XXXXXXXX.py)"
-ANALYST_LOG="$(mktemp /tmp/ccdc-analyst-output.XXXXXXXX)"
-
-# Download analyst account creation script
-if ! wget -q -O "$ANALYST_SCRIPT" "$ANALYST_URL"; then
-    echo "FAIL | Could not download analyst setup script"
-    rm -f "$ANALYST_SCRIPT" "$ANALYST_LOG"
-    exit 1
-fi
-
-echo "PASS | Analyst setup script downloaded"
-
-# Run Python script interactively
-if python3 -u "$ANALYST_SCRIPT" | tee "$ANALYST_LOG"; then
-    if grep -q "^SUCCESS: Splunk Web account " "$ANALYST_LOG"; then
-        echo "PASS | Splunk Analyst account created successfully"
+if yesno 'Create or verify a limited Splunk analyst account now?'; then
+    say '=== Optional Splunk Analyst Account Setup ==='
+    ANALYST_SCRIPT=''
+    ANALYST_LOG=''
+    analyst_ready=0
+    if [[ -n "${CCDC_OFFLINE_ROOT:-}" ]]; then
+        ANALYST_SCRIPT="${CCDC_OFFLINE_ROOT%/}/Dashboards/create-splunk-analyst.py"
+        if [[ -s "$ANALYST_SCRIPT" ]]; then analyst_ready=1; fi
     else
-        echo "SKIP | Analyst account creation was not completed"
+        ANALYST_SCRIPT="$(mktemp /tmp/ccdc-analyst.XXXXXXXX.py)"
+        ANALYST_LOG="$(mktemp /tmp/ccdc-analyst-output.XXXXXXXX)"
+        ANALYST_URL="https://raw.githubusercontent.com/Moses-Strom/CCDC-temp/${CCDC_REPO_REF:-main}/Dashboards/create-splunk-analyst.py"
+        if wget --https-only -q --tries=2 --timeout=20 -O "$ANALYST_SCRIPT" "$ANALYST_URL"; then
+            if [[ -s "$ANALYST_SCRIPT" ]]; then analyst_ready=1; fi
+        fi
     fi
+    if [[ -z "$ANALYST_LOG" ]]; then
+        ANALYST_LOG="$(mktemp /tmp/ccdc-analyst-output.XXXXXXXX)"
+    fi
+    if [[ "$analyst_ready" -ne 1 ]] || ! python3 - "$ANALYST_SCRIPT" <<'PY_ANALYST_VALIDATE'
+import ast
+from pathlib import Path
+import sys
+ast.parse(Path(sys.argv[1]).read_text(encoding='utf-8'))
+PY_ANALYST_VALIDATE
+    then
+        fail 'Analyst helper missing, empty or invalid; remaining setup will continue'
+    elif python3 -u "$ANALYST_SCRIPT" | tee "$ANALYST_LOG"; then
+        if grep -q '^SUCCESS: Splunk Web account ' "$ANALYST_LOG"; then
+            # Deliberate account creation changes /opt/splunk/etc/passwd.
+            # Keep a separate post-creation hash so later unexpected changes are visible.
+            CCDC_ANALYST_CREATED=1
+            CCDC_ANALYST_CREDENTIALS_AFTER="$(sha256sum "$SPLUNK_HOME/etc/passwd" 2>/dev/null | awk '{print $1}' || true)"
+            say 'REVIEW | Authorized analyst creation changed Splunk credentials; validate original admin login.'
+        elif grep -qE '^SKIP: Analyst account |^PASS \| Existing role' "$ANALYST_LOG"; then
+            say 'PASS | Existing analyst role/account verified or helper skipped changes'
+        else
+            say 'INFO | Analyst helper completed without creating an account; inspect its output.'
+        fi
+    else
+        fail 'Analyst helper returned an error; remaining setup will continue'
+    fi
+    # Delete only temporary scripts, not an offline copy.
+    if [[ -z "${CCDC_OFFLINE_ROOT:-}" ]]; then rm -f -- "$ANALYST_SCRIPT"; fi
+    rm -f -- "$ANALYST_LOG"
 else
-    echo "FAIL | Splunk Analyst account setup failed"
-    rm -f "$ANALYST_SCRIPT" "$ANALYST_LOG"
-    exit 1
+    say 'SKIP | Analyst setup not requested'
 fi
-
-# Cleanup
-rm -f "$ANALYST_SCRIPT" "$ANALYST_LOG"
-
-echo "=== Splunk Analyst Setup Complete ==="
-echo ""
 
 # ==========================================================
 # Remaining original configuration, package updates and optional downloads.
