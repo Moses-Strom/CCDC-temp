@@ -850,7 +850,7 @@ EOF_SUR_UNIT
 }
 
 ccdc_setup_monitoring_input() {
-    say '=== Configure Splunk local monitoring for ClamAV and Suricata logs ==='
+    say '=== Configure Splunk local monitoring for ClamAV, Suricata and auditd logs ==='
     local app="$SPLUNK_HOME/etc/apps/ccdc_endpoint_ids_inputs" owner group
     mkdir -p "$app/default" "$app/local"
     cat > "$app/default/app.conf" <<'EOF_APP'
@@ -860,10 +860,10 @@ is_configured = 1
 is_visible = 0
 [launcher]
 author = CCDC
-description = Local Suricata IDS and ClamAV monitoring
+description = Local Suricata IDS, ClamAV and auditd monitoring
 EOF_APP
     cat > "$app/local/inputs.conf" <<'EOF_MON'
-# Both inputs are disabled automatically if no matching file is present.
+# Monitors only have events once their source log exists and is readable.
 [monitor:///var/log/suricata/eve.json]
 disabled = 0
 sourcetype = suricata:eve
@@ -871,6 +871,11 @@ sourcetype = suricata:eve
 [monitor:///var/log/clamav/clamonacc.log]
 disabled = 0
 sourcetype = clamav:clamonacc
+
+[monitor:///var/log/audit/audit.log]
+disabled = 0
+sourcetype = linux:audit
+index = main
 EOF_MON
     cat > "$app/local/props.conf" <<'EOF_PROPS'
 [suricata:eve]
@@ -886,13 +891,13 @@ EOF_PROPS
         group="$(id -gn "$owner")"
         chown -R -- "$owner:$group" "$app"
         if command -v setfacl >/dev/null 2>&1; then
-            for directory in /var/log/suricata /var/log/clamav; do
+            for directory in /var/log/suricata /var/log/clamav /var/log/audit; do
                 if [[ -d "$directory" ]]; then
                     setfacl -m "u:$owner:rx" "$directory" || warn "ACL failed for $directory"
                     setfacl -m "d:u:$owner:rX" "$directory" || warn "Default ACL failed for $directory"
                 fi
             done
-            for logfile in /var/log/suricata/eve.json /var/log/clamav/clamonacc.log; do
+            for logfile in /var/log/suricata/eve.json /var/log/clamav/clamonacc.log /var/log/audit/audit.log; do
                 if [[ -f "$logfile" ]]; then
                     setfacl -m "u:$owner:r" "$logfile" || warn "Log file ACL failed for $logfile"
                 fi
@@ -907,7 +912,7 @@ EOF_PROPS
     if [[ -f "$SPLUNK_HOME/etc/apps/ccdc_suricata_inputs/local/inputs.conf" ]]; then
         warn 'An older ccdc_suricata_inputs app also exists; check for duplicate Suricata monitor definitions.'
     fi
-    say "Splunk EVE + ClamAV monitors saved under $app (requires a safe Splunk restart to activate)."
+    say "Splunk Suricata + ClamAV + auditd monitors saved under $app (requires a safe Splunk restart to activate)."
 }
 
 # Verification below is read-only: it never installs or reconfigures services.
@@ -1118,12 +1123,25 @@ ccdc_verification() {
     if [[ -f "$SPLUNK_HOME/etc/apps/ccdc_endpoint_ids_inputs/local/inputs.conf" ]]; then
         local monitoring_file="$SPLUNK_HOME/etc/apps/ccdc_endpoint_ids_inputs/local/inputs.conf"
         if grep -Fq '[monitor:///var/log/suricata/eve.json]' "$monitoring_file" &&
-           grep -Fq '[monitor:///var/log/clamav/clamonacc.log]' "$monitoring_file"; then
-            say 'PASS | Splunk local Suricata/ClamAV monitoring inputs configured'
+           grep -Fq '[monitor:///var/log/clamav/clamonacc.log]' "$monitoring_file" &&
+           grep -Fq '[monitor:///var/log/audit/audit.log]' "$monitoring_file"; then
+            say 'PASS | Splunk local Suricata/ClamAV/auditd monitoring inputs configured'
         else say 'FAIL | Splunk monitoring inputs incomplete'; failed=1; fi
     elif command -v suricata >/dev/null 2>&1 || command -v clamonacc >/dev/null 2>&1; then
         say 'FAIL | AV/IDS installed but Splunk log monitoring inputs missing'; failed=1
     else say 'SKIP | No optional AV/IDS monitoring inputs required'; fi
+    if command -v auditctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet auditd.service &&
+           auditctl -l 2>/dev/null | grep -Eq -- '(-k[[:space:]]+|key=)ccdc_'; then
+            say 'PASS | auditd running and CCDC file-change watch rules active'
+            say 'REVIEW | Confirm audit.log readable and fresh audit events searchable in Splunk'
+        else
+            say 'FAIL | auditd installed but service/rules not confirmed'
+            failed=1
+        fi
+    else
+        say 'SKIP | auditd file-change watches not installed'
+    fi
     df -h "$SPLUNK_HOME" | tail -n 1 || true
     if [[ "$CCDC_SETUP_ERRORS" -gt 0 ]]; then
         say "FAIL | $CCDC_SETUP_ERRORS setup operation(s) reported errors"
@@ -1185,13 +1203,13 @@ fi
 # Run only after the root and local-NETLAB-console preflight above.
 # ==========================================================
 say '=== Download and install CCDC Splunk dashboards ==='
-DASHBOARD_URL='https://raw.githubusercontent.com/Moses-Strom/CCDC-temp/refs/heads/main/Dashboards/setup-dashboards-main.sh'
+DASHBOARD_URL="https://raw.githubusercontent.com/Moses-Strom/CCDC-temp/${CCDC_REPO_REF:-main}/Dashboards/setup-dashboards-main.sh"
 if ! command -v wget >/dev/null 2>&1; then
     say 'FAIL | wget is missing; dashboard installation not attempted.' >&2
     exit 1
 fi
 DASHBOARD_SCRIPT="$(mktemp /tmp/ccdc-dashboards.XXXXXXXX.sh)"
-if ! wget -q -O "$DASHBOARD_SCRIPT" "$DASHBOARD_URL"; then
+if ! wget --https-only -q --tries=2 --timeout=20 -O "$DASHBOARD_SCRIPT" "$DASHBOARD_URL"; then
     rm -f -- "$DASHBOARD_SCRIPT"
     say 'FAIL | Could not download CCDC dashboard installer.' >&2
     exit 1
@@ -1240,6 +1258,26 @@ if yesno 'Review/apply PostgreSQL sidecar mitigation before Splunk restart?'; th
         say 'PASS | Sidecar mitigation helper completed'
     else
         fail 'Sidecar mitigation failed or was declined; review exposure and dependency requirements'
+    fi
+fi
+
+# Optional Splunk post-upgrade hardening required by SVD-2026-1001.
+# This refuses to apply on vulnerable 10.0.2; upgrade to >=10.0.10 first.
+# Review/modify config BEFORE the existing early restart; no extra restart.
+if yesno 'Apply post-upgrade scripted-lookup raw-write enforcement? (10.0.10+ only)'; then
+    if ccdc_run_github_helper bash Setup/ccdc-post-upgrade-cve-hardening.sh --apply; then
+        say 'PASS | Post-upgrade lookup enforcement configured'
+    else
+        fail 'Post-upgrade CVE configuration not applied; review Splunk version'
+    fi
+fi
+# Separate optional mitigation for Secure Gateway when dependent apps are unused.
+# Does not update Secure Gateway app; upgrade it separately when applicable.
+if yesno 'Disable Splunk Secure Gateway app if unused (breaks Mobile/Spacebridge/Mission Control)?'; then
+    if ccdc_run_github_helper bash Setup/ccdc-post-upgrade-cve-hardening.sh --disable-secure-gateway; then
+        say 'PASS | Secure Gateway disable configured'
+    else
+        warn 'Secure Gateway remains unchanged; check app version and advisory'
     fi
 fi
 
@@ -1349,6 +1387,23 @@ if command -v clamonacc >/dev/null 2>&1 || command -v suricata >/dev/null 2>&1; 
     # Update ACLs now that the IDS/AV log files may exist. Inputs were already
     # installed and activated by the earlier Splunk restart.
     ccdc_setup_monitoring_input || fail 'Splunk AV/IDS log input ACL refresh failed'
+fi
+
+# Optional persistent file-change auditing. Executed AFTER the early Splunk
+# restart so an APT package install cannot delay initial Web availability.
+# audit.log monitor was installed BEFORE the restart; refresh permissions below.
+if yesno 'Install auditd file-change monitoring on this Debian Splunk VM?'; then
+    if ccdc_run_github_helper bash Setup/ccdc-install-auditd.sh --install; then
+        say 'PASS | auditd helper completed; verify event ingestion'
+        ccdc_setup_monitoring_input || fail 'auditd/Splunk audit.log ACL refresh failed'
+    else
+        fail 'auditd setup failed or was declined; inspect auditd report'
+    fi
+fi
+
+# Local host diagnosis only; other Linux VMs need this check on their own hosts.
+if yesno 'Run local Linux logging/forwarder coverage diagnostic?'; then
+    ccdc_run_github_helper bash Setup/check-linux-log-coverage.sh || warn 'Linux logging diagnostic failed'
 fi
 
 ccdc_verification final
