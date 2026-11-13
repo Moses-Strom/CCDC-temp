@@ -34,6 +34,12 @@ CCDC_SPLUNK_CREDENTIALS_BEFORE=''
 # Status for optional GitHub-hosted hardening features during THIS invocation.
 # Standalone --verify reports independently observable settings instead.
 CCDC_UPGRADE_STATUS=SKIP
+# Retry bookkeeping is separate from CCDC_SETUP_ERRORS: if an initial failure
+# recovers, the final PASS/FAIL status must reflect the actual final state.
+CCDC_UPGRADE_FIRST_FAILED=0
+CCDC_UPGRADE_RETRY_SUCCEEDED=0
+CCDC_POSTUPGRADE_RESTARTED=0
+CCDC_POSTUPGRADE_RESTART_PENDING=0
 CCDC_SECURITY_AUDIT_STATUS=SKIP
 CCDC_POSTGRES_STATUS=SKIP
 CCDC_LOOKUP_STATUS=SKIP
@@ -1150,6 +1156,9 @@ ccdc_verification() {
         say 'FAIL | Optional Splunk upgrade helper failed'; failed=1
     elif [[ -n "$upgrade_version" ]] && dpkg --compare-versions "$upgrade_version" ge "$selected_target"; then
         say "PASS | Splunk installed version $upgrade_version meets approved target $selected_target"
+        if [[ "$CCDC_UPGRADE_RETRY_SUCCEEDED" -eq 1 ]]; then
+            say 'PASS | First upgrade failed; second upgrade invocation recovered and live Splunk status passed'
+        fi
     elif [[ "$CCDC_UPGRADE_STATUS" == SKIP ]]; then
         say "SKIP | Splunk upgrade not completed/selected; installed ${upgrade_version:-unknown}"
         say "REVIEW | Upgrade to at least $selected_target to address known 10.0.x security issues"
@@ -1181,7 +1190,13 @@ ccdc_verification() {
     if [[ "$CCDC_LOOKUP_STATUS" == FAIL ]]; then
         say 'FAIL | Requested post-upgrade lookup-write hardening failed';failed=1
     elif grep -Eiq '^[[:space:]]*scripted_lookup_raw_write_enforcement[[:space:]]*=[[:space:]]*block([[:space:]]|$)' <<< "$lookup_effective"; then
-        say 'PASS | Effective scripted_lookup_raw_write_enforcement = block (restart needed to activate changes)'
+        if [[ "$CCDC_LOOKUP_STATUS" == PASS && "$CCDC_POSTUPGRADE_RESTARTED" -eq 1 ]]; then
+            say 'PASS | Lookup raw-write enforcement configured and post-change Splunk restart succeeded'
+        elif [[ "$CCDC_LOOKUP_STATUS" == PASS && "$CCDC_POSTUPGRADE_RESTART_PENDING" -eq 1 ]]; then
+            say 'REVIEW | Lookup raw-write setting is configured but service restart was declined/pending'
+        else
+            say 'PASS | Effective lookup raw-write setting present in config (loaded service state requires validation)'
+        fi
     elif [[ "$CCDC_LOOKUP_STATUS" == PASS ]]; then
         say 'FAIL | Lookup helper completed but effective required setting absent';failed=1
     elif [[ -n "$upgrade_version" ]] && dpkg --compare-versions "$upgrade_version" ge 10.0.10; then
@@ -1199,7 +1214,11 @@ ccdc_verification() {
         in_install && tolower($0) ~ /^[[:space:]]*state[[:space:]]*=[[:space:]]*disabled([[:space:]]|$)/{ok=1}
         END{exit !ok}
     ' "$gw_conf"; then
-        say 'PASS | Secure Gateway local app state set to disabled; confirm effective state after restart'
+        if [[ "$CCDC_GATEWAY_STATUS" == PASS && "$CCDC_POSTUPGRADE_RESTART_PENDING" -eq 1 ]]; then
+            say 'REVIEW | Secure Gateway locally disabled, but Splunk restart is still pending'
+        else
+            say 'PASS | Secure Gateway local app state set to disabled; verify effective state after restart'
+        fi
     elif [[ "$CCDC_GATEWAY_STATUS" == PASS ]]; then
         say 'FAIL | Gateway helper returned success, but app local state not disabled';failed=1
     else
@@ -1231,7 +1250,10 @@ ccdc_verification() {
     if [[ "$CCDC_SETUP_ERRORS" -gt 0 ]]; then
         say "FAIL | $CCDC_SETUP_ERRORS setup operation(s) reported errors"
         failed=1
-    else say 'PASS | No setup operations explicitly reported errors'; fi
+    elif [[ "$CCDC_UPGRADE_FIRST_FAILED" -eq 1 && "$CCDC_UPGRADE_RETRY_SUCCEEDED" -ne 1 ]]; then
+        say 'FAIL | First upgrade failure was not recovered by the late retry'
+        failed=1
+    else say 'PASS | No unresolved setup operations reported errors'; fi
     say 'INFO | These checks are local; CCDC scoring reachability, actual SSH denial and live IDS/AV alerts require separate remote tests.'
     say 'INFO | PAM restrictions cover standard escalation paths; no mechanism can promise to block all possible privilege-escalation paths.'
     if ((failed)); then say 'RESULT | FAIL: One or more checks need investigation.';return 1;fi
@@ -1297,8 +1319,10 @@ if yesno 'Upgrade installed Splunk Enterprise to the approved 10.0.x maintenance
             say 'SKIP | Upgrade canceled before the package installation'
         else
             CCDC_UPGRADE_STATUS=FAIL
-            fail 'Splunk upgrade failed: do not assume the previous version/service state is intact'
-            if ! yesno 'Continue setup despite failed upgrade? (not recommended)'; then
+            CCDC_UPGRADE_FIRST_FAILED=1
+            warn 'First Splunk upgrade attempt failed; ONE optional retry will be offered near the end.'
+            warn 'Review the failure before proceeding; do not assume Splunk is running or the package is intact.'
+            if ! yesno 'Continue setup after the first failure and offer one upgrade retry near the end? (practice VM only)'; then
                 say 'STOP | Investigate upgrade failure, service and config before running more scripts'
                 exit 1
             fi
@@ -1376,29 +1400,9 @@ if yesno 'Review/apply PostgreSQL sidecar mitigation before Splunk restart?'; th
     fi
 fi
 
-# Optional Splunk post-upgrade hardening required by SVD-2026-1001.
-# This refuses to apply on vulnerable 10.0.2; upgrade to >=10.0.10 first.
-# Review/modify config BEFORE the existing early restart; no extra restart.
-if yesno 'Apply post-upgrade scripted-lookup raw-write enforcement? (10.0.10+ only)'; then
-    if ccdc_run_github_helper bash Setup/ccdc-post-upgrade-cve-hardening.sh --apply; then
-        CCDC_LOOKUP_STATUS=PASS
-        say 'PASS | Post-upgrade lookup enforcement configured'
-    else
-        CCDC_LOOKUP_STATUS=FAIL
-        fail 'Post-upgrade CVE configuration not applied; review Splunk version'
-    fi
-fi
-# Separate optional mitigation for Secure Gateway when dependent apps are unused.
-# Does not update Secure Gateway app; upgrade it separately when applicable.
-if yesno 'Disable Splunk Secure Gateway app if unused (breaks Mobile/Spacebridge/Mission Control)?'; then
-    if ccdc_run_github_helper bash Setup/ccdc-post-upgrade-cve-hardening.sh --disable-secure-gateway; then
-        CCDC_GATEWAY_STATUS=PASS
-        say 'PASS | Secure Gateway disable configured'
-    else
-        CCDC_GATEWAY_STATUS=FAIL
-        fail 'Secure Gateway change failed/declined; check actual app version and advisory'
-    fi
-fi
+# Defer post-upgrade lookup enforcement and Secure Gateway decisions until
+# AFTER the one permitted late upgrade retry (at the bottom of setup).
+# Changes applied then will need a subsequent Splunk restart to take effect.
 
 # ==========================================================
 # Restart NOW, before slower apt upgrades, ClamAV and Suricata downloads.
@@ -1514,6 +1518,120 @@ if yesno 'Run local Linux logging/forwarder coverage diagnostic?'; then
     else
         CCDC_LOGCOVERAGE_STATUS=FAIL
         fail 'Linux logging diagnostic could not complete'
+    fi
+fi
+
+# ==========================================================
+# LAST upgrade attempt: only retry if the FIRST upgrade actually FAILED.
+# A successful first attempt does not re-download or re-install the package.
+# This late retry still requires all confirmations in ccdc-upgrade-splunk.sh.
+# ==========================================================
+if [[ "$CCDC_UPGRADE_FIRST_FAILED" -eq 1 ]]; then
+    say '=== Late Splunk upgrade retry (maximum one additional invocation) ==='
+    warn 'The first upgrade failed; this is not proof of a harmless/transient failure.'
+    if yesno 'Retry the Splunk upgrade helper ONCE now? (may stop/restart Splunk; practice VM)'; then
+        if ccdc_run_github_helper bash Setup/ccdc-upgrade-splunk.sh --upgrade; then
+            # IMPORTANT: helpers may report an already-installed version as PASS.
+            # Require both the actual dpkg version and a live Splunk status check.
+            ccdc_retry_version="$(dpkg-query -W -f='${Version}' splunk 2>/dev/null || true)"
+            ccdc_retry_target="${CCDC_SPLUNK_TARGET_VERSION:-10.0.12}"
+            if [[ -n "$ccdc_retry_version" ]] &&
+               dpkg --compare-versions "$ccdc_retry_version" ge "$ccdc_retry_target" &&
+               "$SPLUNK_BIN" status >/dev/null 2>&1; then
+                CCDC_UPGRADE_STATUS=PASS
+                CCDC_UPGRADE_RETRY_SUCCEEDED=1
+                say "PASS | Late upgrade retry completed; Splunk $ccdc_retry_version is installed and running"
+            else
+                CCDC_UPGRADE_STATUS=FAIL
+                fail 'Late upgrade helper returned success, but target package version or running Splunk was not verified'
+            fi
+        else
+            ccdc_retry_rc=$?
+            CCDC_UPGRADE_STATUS=FAIL
+            fail "Late upgrade attempt failed or was canceled (helper exit code $ccdc_retry_rc)"
+        fi
+    else
+        CCDC_UPGRADE_STATUS=FAIL
+        warn 'Late retry declined; first upgrade failure remains unresolved.'
+    fi
+fi
+
+# ==========================================================
+# Post-upgrade CVE helper LAST: the version gate can now evaluate the result
+# of the second upgrade invocation, rather than failing prematurely.
+# Both opt-ins deliberately remain separate to preserve user choice.
+# ==========================================================
+say '=== Post-upgrade Splunk CVE hardening (after any late upgrade retry) ==='
+ccdc_final_splunk_version="$(dpkg-query -W -f='${Version}' splunk 2>/dev/null || true)"
+ccdc_postupgrade_restart_needed=0
+if [[ -n "$ccdc_final_splunk_version" ]] &&
+   dpkg --compare-versions "$ccdc_final_splunk_version" ge 10.0.10; then
+    if yesno 'Apply post-upgrade scripted-lookup raw-write enforcement? (requires Splunk restart)'; then
+        ccdc_limits_file="$SPLUNK_HOME/etc/system/local/limits.conf"
+        ccdc_limits_before="$(sha256sum "$ccdc_limits_file" 2>/dev/null | awk '{print $1}' || true)"
+        if ccdc_run_github_helper bash Setup/ccdc-post-upgrade-cve-hardening.sh --apply; then
+            CCDC_LOOKUP_STATUS=PASS
+            say 'PASS | Post-upgrade lookup enforcement configuration completed'
+            ccdc_limits_after="$(sha256sum "$ccdc_limits_file" 2>/dev/null | awk '{print $1}' || true)"
+            if [[ "$ccdc_limits_before" != "$ccdc_limits_after" ]]; then
+                ccdc_postupgrade_restart_needed=1
+            fi
+        else
+            CCDC_LOOKUP_STATUS=FAIL
+            fail 'Post-upgrade lookup enforcement failed/declined; investigate before claiming mitigation'
+        fi
+    fi
+else
+    say "SKIP | Post-upgrade lookup enforcement requires Splunk >=10.0.10; current ${ccdc_final_splunk_version:-unknown}"
+fi
+
+# The Secure Gateway app workaround is independent of the Splunk version gate.
+# Disabling the app can break Mobile/Spacebridge/Mission Control integrations.
+if yesno 'Disable Splunk Secure Gateway app if unused? (requires Splunk restart)'; then
+    ccdc_gateway_file="$SPLUNK_HOME/etc/apps/splunk_secure_gateway/local/app.conf"
+    ccdc_gateway_before="$(sha256sum "$ccdc_gateway_file" 2>/dev/null | awk '{print $1}' || true)"
+    if ccdc_run_github_helper bash Setup/ccdc-post-upgrade-cve-hardening.sh --disable-secure-gateway; then
+        CCDC_GATEWAY_STATUS=PASS
+        say 'PASS | Secure Gateway disable configuration completed'
+        ccdc_gateway_after="$(sha256sum "$ccdc_gateway_file" 2>/dev/null | awk '{print $1}' || true)"
+        if [[ "$ccdc_gateway_before" != "$ccdc_gateway_after" ]]; then
+            ccdc_postupgrade_restart_needed=1
+        fi
+    else
+        CCDC_GATEWAY_STATUS=FAIL
+        fail 'Secure Gateway change failed/declined; review actual app version and advisory'
+    fi
+fi
+
+# The early restart happened BEFORE these optional config changes. If the
+# configuration changed, restart again ONLY with explicit operator consent.
+if [[ "$ccdc_postupgrade_restart_needed" -eq 1 ]]; then
+    warn 'CVE hardening modified Splunk config after the early restart; a second restart is required.'
+    if yesno 'Restart Splunk now to activate the late CVE changes? (interrupts Web/query/management)'; then
+        CCDC_SPLUNK_RESTART_REQUESTED=1
+        ccdc_late_restart_healthy=0
+        if "$SPLUNK_BIN" restart; then
+            # Initial service startup can take several seconds. Avoid a false FAIL.
+            for ((ccdc_restart_attempt=0; ccdc_restart_attempt<10; ccdc_restart_attempt++)); do
+                if "$SPLUNK_BIN" status >/dev/null 2>&1; then
+                    ccdc_late_restart_healthy=1
+                    break
+                fi
+                sleep 3
+            done
+        fi
+        if [[ "$ccdc_late_restart_healthy" -eq 1 ]]; then
+            CCDC_RESTARTED=1
+            CCDC_POSTUPGRADE_RESTARTED=1
+            say 'PASS | Splunk restarted and running after late CVE configuration changes'
+        else
+            CCDC_RESTARTED=0
+            CCDC_POSTUPGRADE_RESTART_PENDING=1
+            fail 'Splunk restart/status after late CVE changes failed; check scored ports immediately'
+        fi
+    else
+        CCDC_POSTUPGRADE_RESTART_PENDING=1
+        warn 'CVE configuration written but service restart declined: effective mitigation NOT yet verified'
     fi
 fi
 
