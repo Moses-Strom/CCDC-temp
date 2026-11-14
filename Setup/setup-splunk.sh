@@ -140,6 +140,7 @@ ccdc_setup_pa_syslog_udp514() {
     local main_conf='/etc/rsyslog.conf' legacy='/etc/rsyslog.d/25-ccdc-udp9997.conf'
     local rotate_new='/etc/logrotate.d/ccdc-paloalto-syslog'
     local backup='' main_backup='' temp='' old_legacy='' attempt
+    local log_owner='root' log_group='root' service_user=''
 
     if ! command -v rsyslogd >/dev/null 2>&1; then
         say 'Installing rsyslog ...'
@@ -151,10 +152,18 @@ ccdc_setup_pa_syslog_udp514() {
         return 1
     fi
     install -d -m 0755 -o root -g root /etc/rsyslog.d || return 1
-    if ! getent passwd syslog >/dev/null || ! getent group adm >/dev/null; then
-        warn 'The syslog account or adm group is unavailable.'
-        return 1
+    # Debian rsyslog does not universally use a 'syslog' OS account. systemd
+    # units without User= run as root; honor an explicitly configured User=.
+    service_user="$(systemctl show -p User --value rsyslog.service 2>/dev/null || true)"
+    if [[ -n "$service_user" ]]; then
+        if ! getent passwd "$service_user" >/dev/null; then
+            warn "rsyslog.service User=$service_user is not a valid account."
+            return 1
+        fi
+        log_owner="$service_user"
     fi
+    if getent group adm >/dev/null; then log_group='adm'; fi
+    say "INFO | Using $log_owner:$log_group ownership for the Palo Alto log."
     if [[ -L "$CCDC_SYSLOG_CONF" || -L "$CCDC_SYSLOG_DIR" || -L "$CCDC_SYSLOG_LOG" || -L "$legacy" ]]; then
         warn 'Symlink detected in managed syslog paths; not modifying it.'
         return 1
@@ -170,13 +179,15 @@ ccdc_setup_pa_syslog_udp514() {
         }
         say "INFO | Enabled rsyslog.d include; main config backup: $main_backup"
     fi
-    install -d -m 0750 -o syslog -g adm "$CCDC_SYSLOG_DIR" || return 1
+    install -d -m 0750 -o "$log_owner" -g "$log_group" "$CCDC_SYSLOG_DIR" || return 1
     if [[ ! -e "$CCDC_SYSLOG_LOG" ]]; then
-        install -m 0640 -o syslog -g adm /dev/null "$CCDC_SYSLOG_LOG" || return 1
+        install -m 0640 -o "$log_owner" -g "$log_group" /dev/null "$CCDC_SYSLOG_LOG" || return 1
     elif [[ ! -f "$CCDC_SYSLOG_LOG" ]]; then
         warn 'Palo Alto log destination is not a regular file.'
         return 1
     fi
+    chown -- "$log_owner:$log_group" "$CCDC_SYSLOG_LOG" || return 1
+    chmod 0640 "$CCDC_SYSLOG_LOG" || return 1
     if [[ -f "$CCDC_SYSLOG_CONF" ]]; then
         backup="${CCDC_SYSLOG_CONF}.bak.$(date +%Y%m%d-%H%M%S).$$"
         cp -p -- "$CCDC_SYSLOG_CONF" "$backup" || return 1
@@ -192,12 +203,12 @@ ccdc_setup_pa_syslog_udp514() {
         say "INFO | Disabled managed UDP 9997 rsyslog config: $old_legacy"
     fi
     temp="$(mktemp /etc/rsyslog.d/.ccdc-paloalto.XXXXXXXX)" || return 1
-    cat > "$temp" <<'EOF_CCDC_PA'
+    cat > "$temp" <<EOF_CCDC_PA
 # CCDC Palo Alto: UDP 514 -> local file -> Splunk monitor (no UF needed).
 module(load="imudp")
 ruleset(name="ccdc_paloalto_udp514") {
     action(type="omfile" file="/var/log/paloalto/pan.log"
-           fileOwner="syslog" fileGroup="adm" fileCreateMode="0640")
+           fileOwner="$log_owner" fileGroup="$log_group" fileCreateMode="0640")
     stop
 }
 input(type="imudp" port="514" ruleset="ccdc_paloalto_udp514")
@@ -251,14 +262,14 @@ EOF_CCDC_PA
     fi
     if command -v logrotate >/dev/null 2>&1; then
         [[ ! -f "$rotate_new" ]] || cp -p -- "$rotate_new" "${rotate_new}.bak.$(date +%Y%m%d-%H%M%S).$$"
-        cat > "$rotate_new" <<'EOF_CCDC_PA_ROTATE'
+        cat > "$rotate_new" <<EOF_CCDC_PA_ROTATE
 /var/log/paloalto/pan.log {
     daily
     rotate 7
     compress
     missingok
     notifempty
-    create 0640 syslog adm
+    create 0640 $log_owner $log_group
     sharedscripts
     postrotate
         /bin/systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || true
@@ -534,7 +545,10 @@ ccdc_pa_syslog_ufw_reconcile() {
     fi
     say '=== Actual UFW UDP 514 rules ==='
     ufw status verbose | grep -E '(^Status:|514/udp|9997)' || true
-    if ! LC_ALL=C ufw status | grep -Eq '^514/udp[[:space:]]+ALLOW IN'; then
+    # Avoid a false failure from SIGPIPE: grep -q can exit before 'ufw status'
+    # finishes writing, which fails this pipeline under set -o pipefail.
+    current="$(LC_ALL=C ufw status)" || { warn 'Failed to read UFW status'; return 1; }
+    if ! grep -Eq '^514/udp[[:space:]]+ALLOW IN' <<< "$current"; then
         warn 'FAIL: UFW reports no UDP 514 inbound ALLOW rule.'
         return 1
     fi
