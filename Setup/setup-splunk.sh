@@ -124,6 +124,91 @@ ccdc_syslog_udp_configured() {
         grep -Fqx 'input(type="imudp" port="9997" ruleset="ccdc_udp9997")' "$CCDC_SYSLOG_CONF"
 }
 
+# Detect missing rsyslog main configuration BEFORE installing the UDP drop-in.
+# Error -2104 means a referenced configuration file/directory could not be found.
+# Never invent a substitute rsyslog.conf or silently replace customized settings.
+ccdc_rsyslog_preflight() {
+    local main_conf='/etc/rsyslog.conf' saved='' confirm='' diagnostic=''
+
+    if [[ -L "$main_conf" ]]; then
+        warn "$main_conf is a symlink; review its target manually before enabling UDP syslog."
+        return 1
+    fi
+    if [[ ! -f "$main_conf" ]]; then
+        warn "Missing $main_conf (possible rsyslog -2104 cause)."
+        if ! dpkg-query -W -f='${Status}' rsyslog 2>/dev/null | grep -Fq 'install ok installed' ||
+           ! dpkg -S "$main_conf" >/dev/null 2>&1; then
+            warn 'Rsyslog package ownership is not confirmed; refusing automatic repair.'
+            return 1
+        fi
+        read -r -p 'Restore missing Debian-packaged rsyslog.conf using apt reinstall? Type RESTORE-RSYSLOG-CONF: ' confirm || true
+        if [[ "$confirm" != RESTORE-RSYSLOG-CONF ]]; then
+            warn 'Rsyslog main configuration not restored; UDP syslog setup skipped.'
+            return 1
+        fi
+        # --force-confmiss restores missing Debian conffiles, not existing edited ones.
+        if ! DEBIAN_FRONTEND=noninteractive apt-get -o 'Dpkg::Options::=--force-confmiss' \
+             install --reinstall -y --no-install-recommends rsyslog; then
+            warn 'Package restoration failed; review apt output and package sources.'
+            return 1
+        fi
+    fi
+    if [[ ! -s "$main_conf" || ! -r "$main_conf" ]]; then
+        warn "Rsyslog main configuration is empty/unreadable: $main_conf"
+        return 1
+    fi
+
+    # The stock Debian include may error -2104 if this optional directory is absent.
+    # Refuse an unsafe symlink/path and create ONLY the missing directory.
+    if [[ -L /etc/rsyslog.d || ( -e /etc/rsyslog.d && ! -d /etc/rsyslog.d ) ]]; then
+        warn '/etc/rsyslog.d is not a normal directory; inspect before installing the UDP receiver.'
+        return 1
+    fi
+    if [[ ! -d /etc/rsyslog.d ]]; then
+        install -d -m 0755 -o root -g root /etc/rsyslog.d || return 1
+        say 'INFO | Created missing /etc/rsyslog.d directory.'
+    fi
+
+    # Debian normally includes /etc/rsyslog.d/*.conf. Without that directive,
+    # a valid drop-in is ignored and no UDP socket will be opened.
+    if ! grep -Eq '^[[:space:]]*(\$IncludeConfig[[:space:]]+|include\([[:space:]]*file[[:space:]]*=[[:space:]]*"?)/etc/rsyslog\.d/' "$main_conf"; then
+        warn "$main_conf does not visibly include /etc/rsyslog.d/; UDP listener drop-in may be ignored."
+        read -r -p 'Back up main config and add the standard optional rsyslog.d include? Type ADD-RSYSLOG-INCLUDE: ' confirm || true
+        if [[ "$confirm" != ADD-RSYSLOG-INCLUDE ]]; then
+            warn 'Rsyslog include not approved; stopping before creating a nonfunctional UDP listener.'
+            return 1
+        fi
+        saved="${main_conf}.bak.ccdc.$(date +%Y%m%d-%H%M%S).$$"
+        cp -p -- "$main_conf" "$saved" || return 1
+        if ! printf '\n# CCDC: load Debian rsyslog drop-ins\ninclude(file="/etc/rsyslog.d/*.conf" mode="optional")\n' >> "$main_conf"; then
+            cp -p -- "$saved" "$main_conf" || true
+            warn "Unable to add rsyslog include; restored backup $saved"
+            return 1
+        fi
+        say "INFO | Main rsyslog config backup: $saved"
+    fi
+
+    diagnostic="$(mktemp /root/ccdc-rsyslog-preflight.XXXXXXXX)" || return 1
+    chmod 0600 "$diagnostic"
+    if ! rsyslogd -N1 -f "$main_conf" >"$diagnostic" 2>&1; then
+        warn "Existing rsyslog configuration is invalid. Validation output ($diagnostic):"
+        tail -n 30 "$diagnostic" >&2 || true
+        if [[ -n "$saved" ]]; then
+            cp -p -- "$saved" "$main_conf" || warn "Could not restore $main_conf from $saved"
+        fi
+        return 1
+    fi
+    rm -f -- "$diagnostic"
+    say "PASS | Existing rsyslog config preflight passed: $main_conf"
+}
+
+ccdc_rsyslog_failure_diagnostics() {
+    warn 'Rsyslog details (look for a file/path named near error -2104):'
+    systemctl status rsyslog.service --no-pager -l 2>&1 | tail -n 18 >&2 || true
+    journalctl -u rsyslog.service -n 25 --no-pager 2>&1 | tail -n 25 >&2 || true
+    ss -H -lunp 2>/dev/null | grep -E '(:9997[[:space:]]|:9997$)' >&2 || true
+}
+
 ccdc_setup_syslog_udp_9997() {
     say '=== Configure rsyslog raw syslog receiver on UDP 9997 ==='
     say 'Splunk Universal Forwarders keep using TCP 9997; this uses a separate UDP socket.'
@@ -151,6 +236,8 @@ ccdc_setup_syslog_udp_9997() {
         warn 'UDP 9997 is already bound without the CCDC config; refusing to claim an unknown listener.'
         return 1
     fi
+    # Do this before creating the drop-in; prevents -2104 and silent include failures.
+    ccdc_rsyslog_preflight || return 1
     install -d -m 0750 -o syslog -g adm "$CCDC_SYSLOG_DIR" || return 1
     if [[ ! -e "$CCDC_SYSLOG_LOG" ]]; then
         install -m 0640 -o syslog -g adm /dev/null "$CCDC_SYSLOG_LOG" || return 1
@@ -175,12 +262,14 @@ EOF_CCDC_SYSLOG
     chmod 0644 "$temp"
     mv -f -- "$temp" "$CCDC_SYSLOG_CONF" || return 1
     if ! rsyslogd -N1 -f /etc/rsyslog.conf; then
-        warn 'Rsyslog validation failed; restoring previous config.'
+        warn 'Rsyslog validation failed after adding UDP 9997; restoring previous config.'
+        ccdc_rsyslog_failure_diagnostics
         if ((was_present)); then cp -p -- "$backup" "$CCDC_SYSLOG_CONF"; else rm -f -- "$CCDC_SYSLOG_CONF"; fi
         return 1
     fi
     if ! systemctl enable rsyslog.service || ! systemctl restart rsyslog.service; then
         warn 'Rsyslog failed to enable/restart; restoring prior config.'
+        ccdc_rsyslog_failure_diagnostics
         if ((was_present)); then cp -p -- "$backup" "$CCDC_SYSLOG_CONF"; else rm -f -- "$CCDC_SYSLOG_CONF"; fi
         systemctl restart rsyslog.service || true
         return 1
@@ -191,6 +280,7 @@ EOF_CCDC_SYSLOG
     done
     if ! systemctl is-active --quiet rsyslog.service || ! ccdc_udp9997_listening; then
         warn 'rsyslog.service is not active or UDP 9997 does not listen; restoring config.'
+        ccdc_rsyslog_failure_diagnostics
         if ((was_present)); then cp -p -- "$backup" "$CCDC_SYSLOG_CONF"; else rm -f -- "$CCDC_SYSLOG_CONF"; fi
         systemctl restart rsyslog.service || true
         return 1
