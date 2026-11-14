@@ -4,7 +4,7 @@
 # Includes Splunk receiver/auth protection + SSH restriction + interactive Linux root
 # password rotation + optional administrator account audit/expiry
 # + ClamAV notify-only real-time scanning + passive Suricata IDS
-# + opt-in UFW inbound default-deny with ONLY 22/8000/8089/9997 TCP allowed.
+# + opt-in UFW inbound default-deny with TCP 22/8000/8089/9997 and UDP 9997 (if syslog configured).
 # Run from NETLAB VM console: sudo bash setup-splunk.sh
 # Read-only review: sudo bash setup-splunk.sh --verify
 set -euo pipefail
@@ -46,6 +46,11 @@ CCDC_LOOKUP_STATUS=SKIP
 CCDC_GATEWAY_STATUS=SKIP
 CCDC_AUDITD_STATUS=SKIP
 CCDC_LOGCOVERAGE_STATUS=SKIP
+CCDC_SYSLOG_STATUS=SKIP
+CCDC_SYSLOG_REQUESTED=0
+CCDC_SYSLOG_CONF=/etc/rsyslog.d/25-ccdc-udp9997.conf
+CCDC_SYSLOG_DIR=/var/log/remote-syslog
+CCDC_SYSLOG_LOG=$CCDC_SYSLOG_DIR/udp9997.log
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN | %s\n' "$*" >&2; }
@@ -106,6 +111,111 @@ snapshot_ports() {
     for p in 8000 8089 9997; do
         if port_listening "$p"; then CCDC_BASELINE_PORTS+=" $p "; fi
     done
+}
+
+# A UDP socket and a TCP socket with the same port number are distinct.
+# Splunk forwarders retain TCP 9997; rsyslog accepts raw UDP syslog on 9997.
+ccdc_udp9997_listening() {
+    ss -H -lnu 2>/dev/null | awk '$4 ~ /:9997$/ {found=1} END {exit !found}'
+}
+
+ccdc_syslog_udp_configured() {
+    [[ -f "$CCDC_SYSLOG_CONF" && ! -L "$CCDC_SYSLOG_CONF" ]] &&
+        grep -Fqx 'input(type="imudp" port="9997" ruleset="ccdc_udp9997")' "$CCDC_SYSLOG_CONF"
+}
+
+ccdc_setup_syslog_udp_9997() {
+    say '=== Configure rsyslog raw syslog receiver on UDP 9997 ==='
+    say 'Splunk Universal Forwarders keep using TCP 9997; this uses a separate UDP socket.'
+    local backup='' temp='' was_present=0 attempt
+    if ! command -v rsyslogd >/dev/null 2>&1; then
+        say 'Installing Debian rsyslog package (no broad package upgrade) ...'
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rsyslog || return 1
+    fi
+    command -v rsyslogd >/dev/null 2>&1 || { warn 'rsyslogd unavailable after installation'; return 1; }
+    # Splunk's daemon user needs read ACLs for the protected syslog file.
+    if ! command -v setfacl >/dev/null 2>&1; then
+        say 'Installing acl package so Splunk can read the protected remote syslog file ...'
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends acl || return 1
+    fi
+    command -v setfacl >/dev/null 2>&1 || { warn 'setfacl unavailable; cannot configure Splunk read ACL'; return 1; }
+    if ! getent passwd syslog >/dev/null || ! getent group adm >/dev/null; then
+        warn 'Expected Debian syslog account or adm group missing; refusing to configure log directory.'
+        return 1
+    fi
+    if [[ -L "$CCDC_SYSLOG_CONF" || -L "$CCDC_SYSLOG_DIR" || -L "$CCDC_SYSLOG_LOG" ]]; then
+        warn 'Syslog config/log path is a symlink; inspect manually before writing.'
+        return 1
+    fi
+    if ccdc_udp9997_listening && ! ccdc_syslog_udp_configured; then
+        warn 'UDP 9997 is already bound without the CCDC config; refusing to claim an unknown listener.'
+        return 1
+    fi
+    install -d -m 0750 -o syslog -g adm "$CCDC_SYSLOG_DIR" || return 1
+    if [[ ! -e "$CCDC_SYSLOG_LOG" ]]; then
+        install -m 0640 -o syslog -g adm /dev/null "$CCDC_SYSLOG_LOG" || return 1
+    fi
+    mkdir -p /etc/rsyslog.d || return 1
+    if [[ -f "$CCDC_SYSLOG_CONF" ]]; then
+        was_present=1
+        backup="${CCDC_SYSLOG_CONF}.bak.$(date +%Y%m%d-%H%M%S).$$"
+        cp -p -- "$CCDC_SYSLOG_CONF" "$backup" || return 1
+    fi
+    temp="$(mktemp /etc/rsyslog.d/.ccdc-udp9997.XXXXXXXX)" || return 1
+    cat > "$temp" <<'EOF_CCDC_SYSLOG'
+# CCDC: remote syslog only. Existing local syslog routing remains intact.
+module(load="imudp")
+ruleset(name="ccdc_udp9997") {
+    action(type="omfile" file="/var/log/remote-syslog/udp9997.log"
+           fileOwner="syslog" fileGroup="adm" fileCreateMode="0640")
+    stop
+}
+input(type="imudp" port="9997" ruleset="ccdc_udp9997")
+EOF_CCDC_SYSLOG
+    chmod 0644 "$temp"
+    mv -f -- "$temp" "$CCDC_SYSLOG_CONF" || return 1
+    if ! rsyslogd -N1 -f /etc/rsyslog.conf; then
+        warn 'Rsyslog validation failed; restoring previous config.'
+        if ((was_present)); then cp -p -- "$backup" "$CCDC_SYSLOG_CONF"; else rm -f -- "$CCDC_SYSLOG_CONF"; fi
+        return 1
+    fi
+    if ! systemctl enable rsyslog.service || ! systemctl restart rsyslog.service; then
+        warn 'Rsyslog failed to enable/restart; restoring prior config.'
+        if ((was_present)); then cp -p -- "$backup" "$CCDC_SYSLOG_CONF"; else rm -f -- "$CCDC_SYSLOG_CONF"; fi
+        systemctl restart rsyslog.service || true
+        return 1
+    fi
+    for attempt in 1 2 3 4 5; do
+        if systemctl is-active --quiet rsyslog.service && ccdc_udp9997_listening; then break; fi
+        sleep 1
+    done
+    if ! systemctl is-active --quiet rsyslog.service || ! ccdc_udp9997_listening; then
+        warn 'rsyslog.service is not active or UDP 9997 does not listen; restoring config.'
+        if ((was_present)); then cp -p -- "$backup" "$CCDC_SYSLOG_CONF"; else rm -f -- "$CCDC_SYSLOG_CONF"; fi
+        systemctl restart rsyslog.service || true
+        return 1
+    fi
+    # Prevent unbounded syslog growth. No service restart is needed for this file.
+    if command -v logrotate >/dev/null 2>&1; then
+        cat > /etc/logrotate.d/ccdc-remote-syslog <<'EOF_CCDC_ROTATE'
+/var/log/remote-syslog/udp9997.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 0640 syslog adm
+    sharedscripts
+    postrotate
+        /bin/systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || true
+    endscript
+}
+EOF_CCDC_ROTATE
+    else
+        warn 'logrotate is absent; configure log rotation before accepting sustained syslog volumes.'
+    fi
+    say 'PASS | rsyslog is receiving on UDP 9997; file is ready for Splunk monitoring.'
+    say 'REVIEW | Remote sender/firewall and live Splunk ingestion must be tested separately.'
 }
 
 ccdc_configure_receiver() {
@@ -349,12 +459,14 @@ ccdc_configure_firewall() {
     say ''
     say '=== Optional CCDC UFW host firewall ==='
     say 'New inbound connections: DENY by default.'
-    say 'Explicit inbound TCP allows: 22/SSH, 8000/Web, 8089/management, 9997/forwarders.'
+    say 'Inbound TCP: 22/SSH, 8000/Web, 8089/management, 9997/forwarders.'
+    say 'If the CCDC rsyslog receiver is configured: also allow UDP 9997 for remote syslog.'
     say 'Outbound connections: ALLOW by default (required for packages, DNS, clocks and other dependencies).'
     say 'Standard UFW ICMP handling is retained; verify CCDC ping scoring afterward.'
     say 'This changes ONLY the Debian VM firewall, not the Palo Alto firewall.'
+    say 'NOTE: Palo Alto/VyOS or upstream ACLs must also allow UDP 9997 from authorized senders.'
     say 'WARNING: Replacing existing UFW user rules could interrupt additional scored services.'
-    if ! yesno 'Reset UFW rules to ONLY these inbound TCP allowances and ENABLE default-deny'; then
+    if ! yesno 'Reset UFW rules to the listed inbound TCP allowances (and UDP 9997 if rsyslog is configured) and ENABLE default-deny'; then
         say 'SKIP | UFW rules unchanged by operator choice.'
         return 0
     fi
@@ -396,6 +508,14 @@ ccdc_configure_firewall() {
         warn 'Failed while staging UFW rules; check status BEFORE enabling.'
         return 1
     fi
+    # Only expose UDP when the CCDC rsyslog listener was installed/configured.
+    # This is a separate protocol, not the Splunk-to-Splunk TCP 9997 receiver.
+    if ccdc_syslog_udp_configured; then
+        if ! ufw allow 9997/udp comment 'CCDC remote syslog'; then
+            warn 'Could not stage UDP 9997; do not assume remote syslog will arrive.'
+            return 1
+        fi
+    fi
     say 'Staged UFW rules:'
     ufw show added || true
     if ! ufw --force enable; then
@@ -410,7 +530,7 @@ ccdc_configure_firewall() {
         return 1
     fi
     CCDC_UFW_APPLIED=1
-    say 'PASS | UFW active: deny incoming; allow outgoing; required inbound TCP ports allowed.'
+    say 'PASS | UFW active: deny incoming; allow outgoing; TCP allowances and configured UDP syslog rule staged.'
     say 'Verify remote scoring, forwarding and ping from other CCDC machines.'
 }
 
@@ -863,7 +983,7 @@ EOF_SUR_UNIT
 }
 
 ccdc_setup_monitoring_input() {
-    say '=== Configure Splunk local monitoring for ClamAV, Suricata and auditd logs ==='
+    say '=== Configure Splunk local monitoring for ClamAV, Suricata, auditd and remote syslog ==='
     local app="$SPLUNK_HOME/etc/apps/ccdc_endpoint_ids_inputs" owner group
     mkdir -p "$app/default" "$app/local"
     cat > "$app/default/app.conf" <<'EOF_APP'
@@ -873,7 +993,7 @@ is_configured = 1
 is_visible = 0
 [launcher]
 author = CCDC
-description = Local Suricata IDS, ClamAV and auditd monitoring
+description = Local Suricata IDS, ClamAV, auditd and remote syslog monitoring
 EOF_APP
     cat > "$app/local/inputs.conf" <<'EOF_MON'
 # Monitors only have events once their source log exists and is readable.
@@ -888,6 +1008,11 @@ sourcetype = clamav:clamonacc
 [monitor:///var/log/audit/audit.log]
 disabled = 0
 sourcetype = linux:audit
+index = main
+
+[monitor:///var/log/remote-syslog/udp9997.log]
+disabled = 0
+sourcetype = ccdc:remote_syslog
 index = main
 EOF_MON
     cat > "$app/local/props.conf" <<'EOF_PROPS'
@@ -904,13 +1029,13 @@ EOF_PROPS
         group="$(id -gn "$owner")"
         chown -R -- "$owner:$group" "$app"
         if command -v setfacl >/dev/null 2>&1; then
-            for directory in /var/log/suricata /var/log/clamav /var/log/audit; do
+            for directory in /var/log/suricata /var/log/clamav /var/log/audit /var/log/remote-syslog; do
                 if [[ -d "$directory" ]]; then
                     setfacl -m "u:$owner:rx" "$directory" || warn "ACL failed for $directory"
                     setfacl -m "d:u:$owner:rX" "$directory" || warn "Default ACL failed for $directory"
                 fi
             done
-            for logfile in /var/log/suricata/eve.json /var/log/clamav/clamonacc.log /var/log/audit/audit.log; do
+            for logfile in /var/log/suricata/eve.json /var/log/clamav/clamonacc.log /var/log/audit/audit.log /var/log/remote-syslog/udp9997.log; do
                 if [[ -f "$logfile" ]]; then
                     setfacl -m "u:$owner:r" "$logfile" || warn "Log file ACL failed for $logfile"
                 fi
@@ -925,7 +1050,7 @@ EOF_PROPS
     if [[ -f "$SPLUNK_HOME/etc/apps/ccdc_suricata_inputs/local/inputs.conf" ]]; then
         warn 'An older ccdc_suricata_inputs app also exists; check for duplicate Suricata monitor definitions.'
     fi
-    say "Splunk Suricata + ClamAV + auditd monitors saved under $app (requires a safe Splunk restart to activate)."
+    say "Splunk Suricata + ClamAV + auditd + remote syslog monitors saved under $app (requires a safe Splunk restart to activate)."
 }
 
 # Verification below is read-only: it never installs or reconfigures services.
@@ -1062,8 +1187,15 @@ ccdc_verification() {
                 say "PASS | UFW inbound TCP $p allowed"
             else say "FAIL | UFW inbound TCP $p missing"; failed=1; fi
         done
-        # Reject any additional UFW ALLOW IN rules, including IPv6 rules.
-        if awk '$2 == "ALLOW" && $3 == "IN" && $1 !~ /^(22|8000|8089|9997)\/tcp$/ {found=1} END {exit !found}' <<< "$ufw_status"; then
+        # Reject unknown inbound exceptions, but permit UDP 9997 only for configured rsyslog.
+        local allowed_syslog_udp=0
+        if ccdc_syslog_udp_configured; then allowed_syslog_udp=1; fi
+        if awk -v allow_udp="$allowed_syslog_udp" '
+          $2 == "ALLOW" && $3 == "IN" &&
+          $1 !~ /^(22|8000|8089|9997)\/tcp$/ &&
+          !(allow_udp == 1 && $1 == "9997/udp") {found=1}
+          END {exit !found}
+        ' <<< "$ufw_status"; then
             say 'FAIL | UFW contains an unexpected additional inbound ALLOW rule'
             failed=1
         else say 'PASS | No additional UFW user inbound ALLOW rules found'; fi
@@ -1078,6 +1210,46 @@ ccdc_verification() {
         fi
     elif [[ -f /etc/default/ufw ]]; then
         say 'INFO | UFW IPv6 configuration was not changed by this invocation'
+    fi
+
+    # Local UDP syslog checks are static; a real remote test is still necessary.
+    if [[ "$CCDC_SYSLOG_STATUS" == FAIL ]]; then
+        say 'FAIL | UDP 9997 rsyslog setup failed during this run'; failed=1
+    elif ccdc_syslog_udp_configured; then
+        if command -v rsyslogd >/dev/null 2>&1 &&
+           rsyslogd -N1 -f /etc/rsyslog.conf >/dev/null 2>&1 &&
+           systemctl is-active --quiet rsyslog.service && ccdc_udp9997_listening; then
+            say 'PASS | rsyslog configuration valid, service active, UDP 9997 listening'
+        else
+            say 'FAIL | rsyslog UDP 9997 listener invalid or inactive'; failed=1
+        fi
+        if [[ -f "$CCDC_SYSLOG_LOG" && ! -L "$CCDC_SYSLOG_LOG" ]]; then
+            say 'PASS | Remote syslog output file exists'
+        else
+            say 'FAIL | Remote syslog output file absent or unsafe';failed=1
+        fi
+        local remote_input="$SPLUNK_HOME/etc/apps/ccdc_endpoint_ids_inputs/local/inputs.conf"
+        if [[ -f "$remote_input" ]] && grep -Fqx '[monitor:///var/log/remote-syslog/udp9997.log]' "$remote_input" &&
+           grep -Fq 'sourcetype = ccdc:remote_syslog' "$remote_input"; then
+            say 'PASS | Splunk remote syslog file monitor configured (ingestion unverified)'
+        else
+            say 'FAIL | Splunk remote syslog input not configured';failed=1
+        fi
+        if command -v ufw >/dev/null 2>&1 &&
+           LC_ALL=C ufw status 2>/dev/null | grep -Eq '^Status: active$'; then
+            if grep -Eq '^9997/udp[[:space:]]+ALLOW IN' <<< "$ufw_status"; then
+                say 'PASS | UFW has inbound UDP 9997 rule for syslog'
+            else
+                say 'FAIL | rsyslog configured but UFW inbound UDP 9997 rule absent';failed=1
+            fi
+        else
+            say 'SKIP | UFW inactive/unavailable; remote UDP 9997 reachability cannot be confirmed'
+        fi
+        say 'REVIEW | Live remote syslog delivery and Splunk indexing need separate tests'
+    elif [[ "$CCDC_SYSLOG_REQUESTED" -eq 1 ]]; then
+        say 'FAIL | UDP 9997 syslog requested but not configured';failed=1
+    else
+        say 'SKIP | UDP 9997 rsyslog receiver not configured/requested'
     fi
 
     if [[ "${1:-}" == final && "$CCDC_CLAMAV_REQUESTED" -eq 0 && ! -f /etc/clamav/clamd.conf ]]; then
@@ -1381,6 +1553,17 @@ ccdc_configure_receiver || fail 'Splunk receiver setup failed'
 ccdc_configure_lockout || fail 'Splunk lockout setup failed'
 ccdc_apply_ssh_restriction || fail 'SSH restriction failed'
 ccdc_block_ssh_elevation || fail 'SSH sudo/su elevation restriction failed'
+# Configure UDP listener before UFW is reset so the associated rule is retained.
+# If skipped on a later run, a preexisting CCDC listener still receives its rule.
+if yesno 'Install/enable rsyslog receiver for remote syslog on UDP 9997?'; then
+    CCDC_SYSLOG_REQUESTED=1
+    if ccdc_setup_syslog_udp_9997; then
+        CCDC_SYSLOG_STATUS=PASS
+    else
+        CCDC_SYSLOG_STATUS=FAIL
+        fail 'UDP 9997 rsyslog receiver setup failed'
+    fi
+fi
 ccdc_configure_firewall || fail 'UFW configuration failed'
 ccdc_optional_ufw_ipv6_block || fail 'Optional UFW IPv6 change failed'
 
