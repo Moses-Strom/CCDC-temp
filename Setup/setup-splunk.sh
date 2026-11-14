@@ -4,7 +4,7 @@
 # Includes Splunk receiver/auth protection + SSH restriction + interactive Linux root
 # password rotation + optional administrator account audit/expiry
 # + ClamAV notify-only real-time scanning + passive Suricata IDS
-# + opt-in UFW inbound default-deny with TCP 22/8000/8089/9997, and PA syslog UDP 514 when configured.
+# + opt-in UFW inbound default-deny with TCP 22/8000/8089/9997, and Palo Alto syslog UDP 514.
 # Run from NETLAB VM console: sudo bash setup-splunk.sh
 # Read-only review: sudo bash setup-splunk.sh --verify
 set -euo pipefail
@@ -51,8 +51,10 @@ CCDC_SYSLOG_REQUESTED=0
 CCDC_SYSLOG_CONF=/etc/rsyslog.d/25-ccdc-paloalto-udp514.conf
 CCDC_SYSLOG_DIR=/var/log/paloalto
 CCDC_SYSLOG_LOG=$CCDC_SYSLOG_DIR/pan.log
-# User-supplied possible Palo Alto syslog source IPs; verify actual interface/service-route source.
-read -r -a CCDC_PA_SYSLOG_SOURCES <<< "${CCDC_PA_SYSLOG_ALLOWED_IPS:-172.20.240.200 172.20.240.254}"
+# UDP 514 is permitted from any source by default so unknown Palo Alto service-route
+# addresses do not silently fail. To limit sources, set CCDC_PA_SYSLOG_ALLOWED_IPS
+# to space-separated IPs (example: "172.20.240.200 172.20.240.254").
+read -r -a CCDC_PA_SYSLOG_SOURCES <<< "${CCDC_PA_SYSLOG_ALLOWED_IPS:-}"
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN | %s\n' "$*" >&2; }
@@ -125,152 +127,73 @@ ccdc_pa_syslog_configured() {
         grep -Fqx 'input(type="imudp" port="514" ruleset="ccdc_paloalto_udp514")' "$CCDC_SYSLOG_CONF"
 }
 
-# Detect missing rsyslog main configuration BEFORE installing the UDP drop-in.
-# Error -2104 means a referenced configuration file/directory could not be found.
-# Never invent a substitute rsyslog.conf or silently replace customized settings.
-ccdc_rsyslog_preflight() {
-    local main_conf='/etc/rsyslog.conf' saved='' confirm='' diagnostic=''
-
-    if [[ -L "$main_conf" ]]; then
-        warn "$main_conf is a symlink; review its target manually before enabling UDP syslog."
-        return 1
-    fi
-    if [[ ! -f "$main_conf" ]]; then
-        warn "Missing $main_conf (possible rsyslog -2104 cause)."
-        if ! dpkg-query -W -f='${Status}' rsyslog 2>/dev/null | grep -Fq 'install ok installed' ||
-           ! dpkg -S "$main_conf" >/dev/null 2>&1; then
-            warn 'Rsyslog package ownership is not confirmed; refusing automatic repair.'
-            return 1
-        fi
-        read -r -p 'Restore missing Debian-packaged rsyslog.conf using apt reinstall? Type RESTORE-RSYSLOG-CONF: ' confirm || true
-        if [[ "$confirm" != RESTORE-RSYSLOG-CONF ]]; then
-            warn 'Rsyslog main configuration not restored; UDP syslog setup skipped.'
-            return 1
-        fi
-        # --force-confmiss restores missing Debian conffiles, not existing edited ones.
-        if ! DEBIAN_FRONTEND=noninteractive apt-get -o 'Dpkg::Options::=--force-confmiss' \
-             install --reinstall -y --no-install-recommends rsyslog; then
-            warn 'Package restoration failed; review apt output and package sources.'
-            return 1
-        fi
-    fi
-    if [[ ! -s "$main_conf" || ! -r "$main_conf" ]]; then
-        warn "Rsyslog main configuration is empty/unreadable: $main_conf"
-        return 1
-    fi
-
-    # The stock Debian include may error -2104 if this optional directory is absent.
-    # Refuse an unsafe symlink/path and create ONLY the missing directory.
-    if [[ -L /etc/rsyslog.d || ( -e /etc/rsyslog.d && ! -d /etc/rsyslog.d ) ]]; then
-        warn '/etc/rsyslog.d is not a normal directory; inspect before installing the UDP receiver.'
-        return 1
-    fi
-    if [[ ! -d /etc/rsyslog.d ]]; then
-        install -d -m 0755 -o root -g root /etc/rsyslog.d || return 1
-        say 'INFO | Created missing /etc/rsyslog.d directory.'
-    fi
-
-    # Debian normally includes /etc/rsyslog.d/*.conf. Without that directive,
-    # a valid drop-in is ignored and no UDP socket will be opened.
-    if ! grep -Eq '^[[:space:]]*(\$IncludeConfig[[:space:]]+|include\([[:space:]]*file[[:space:]]*=[[:space:]]*"?)/etc/rsyslog\.d/' "$main_conf"; then
-        warn "$main_conf does not visibly include /etc/rsyslog.d/; UDP listener drop-in may be ignored."
-        read -r -p 'Back up main config and add the standard optional rsyslog.d include? Type ADD-RSYSLOG-INCLUDE: ' confirm || true
-        if [[ "$confirm" != ADD-RSYSLOG-INCLUDE ]]; then
-            warn 'Rsyslog include not approved; stopping before creating a nonfunctional UDP listener.'
-            return 1
-        fi
-        saved="${main_conf}.bak.ccdc.$(date +%Y%m%d-%H%M%S).$$"
-        cp -p -- "$main_conf" "$saved" || return 1
-        if ! printf '\n# CCDC: load Debian rsyslog drop-ins\ninclude(file="/etc/rsyslog.d/*.conf" mode="optional")\n' >> "$main_conf"; then
-            cp -p -- "$saved" "$main_conf" || true
-            warn "Unable to add rsyslog include; restored backup $saved"
-            return 1
-        fi
-        say "INFO | Main rsyslog config backup: $saved"
-    fi
-
-    diagnostic="$(mktemp /root/ccdc-rsyslog-preflight.XXXXXXXX)" || return 1
-    chmod 0600 "$diagnostic"
-    if ! rsyslogd -N1 -f "$main_conf" >"$diagnostic" 2>&1; then
-        warn "Existing rsyslog configuration is invalid. Validation output ($diagnostic):"
-        tail -n 30 "$diagnostic" >&2 || true
-        if [[ -n "$saved" ]]; then
-            cp -p -- "$saved" "$main_conf" || warn "Could not restore $main_conf from $saved"
-        fi
-        return 1
-    fi
-    rm -f -- "$diagnostic"
-    say "PASS | Existing rsyslog config preflight passed: $main_conf"
-}
-
+# Simplified, observable Palo Alto receiver setup. No listener setting depends on UFW.
 ccdc_rsyslog_failure_diagnostics() {
-    warn 'Rsyslog details (look for a file/path named near error -2104):'
-    systemctl status rsyslog.service --no-pager -l 2>&1 | tail -n 18 >&2 || true
+    warn 'Rsyslog failure details:'
+    systemctl status rsyslog.service --no-pager -l 2>&1 | tail -n 20 >&2 || true
     journalctl -u rsyslog.service -n 25 --no-pager 2>&1 | tail -n 25 >&2 || true
     ss -H -lunp 2>/dev/null | grep -E '(:514[[:space:]]|:514$)' >&2 || true
 }
 
 ccdc_setup_pa_syslog_udp514() {
-    say '=== Configure Palo Alto syslog receiver on UDP 514 ==='
-    say 'This does NOT alter Splunk Universal Forwarder TCP 9997.'
-    local backup='' legacy_backup='' temp='' was_present=0 attempt
-    local legacy='/etc/rsyslog.d/25-ccdc-udp9997.conf'
-    local rotate_old='/etc/logrotate.d/ccdc-remote-syslog'
+    say '=== Configure rsyslog Palo Alto UDP 514 listener ==='
+    local main_conf='/etc/rsyslog.conf' legacy='/etc/rsyslog.d/25-ccdc-udp9997.conf'
     local rotate_new='/etc/logrotate.d/ccdc-paloalto-syslog'
-    local rotate_backups='/root/ccdc-paloalto-logrotate-backups'
+    local backup='' main_backup='' temp='' old_legacy='' attempt
 
     if ! command -v rsyslogd >/dev/null 2>&1; then
-        say 'Installing Debian rsyslog package ...'
+        say 'Installing rsyslog ...'
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rsyslog || return 1
     fi
-    command -v rsyslogd >/dev/null 2>&1 || { warn 'rsyslogd unavailable'; return 1; }
-    if ! command -v setfacl >/dev/null 2>&1; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends acl || return 1
+    if [[ ! -f "$main_conf" || -L "$main_conf" || ! -r "$main_conf" ||
+          -L /etc/rsyslog.d || ( -e /etc/rsyslog.d && ! -d /etc/rsyslog.d ) ]]; then
+        warn 'Unexpected /etc/rsyslog.conf or /etc/rsyslog.d; refusing unsafe modification.'
+        return 1
     fi
-    command -v setfacl >/dev/null 2>&1 || { warn 'setfacl unavailable'; return 1; }
+    install -d -m 0755 -o root -g root /etc/rsyslog.d || return 1
     if ! getent passwd syslog >/dev/null || ! getent group adm >/dev/null; then
-        warn 'Debian syslog account or adm group unavailable.'
+        warn 'The syslog account or adm group is unavailable.'
         return 1
     fi
     if [[ -L "$CCDC_SYSLOG_CONF" || -L "$CCDC_SYSLOG_DIR" || -L "$CCDC_SYSLOG_LOG" || -L "$legacy" ]]; then
-        warn 'Refusing symlinked rsyslog configuration or log path.'
+        warn 'Symlink detected in managed syslog paths; not modifying it.'
         return 1
     fi
-    if ccdc_pa_udp514_listening && ! ccdc_pa_syslog_configured; then
-        warn 'UDP 514 already has a listener not controlled by the CCDC Palo Alto config.'
-        return 1
+    # Ensure rsyslog actually loads drop-ins. Without an include, rsyslog can be
+    # active with no UDP socket even though the new .conf is perfectly valid.
+    if ! grep -Eq '^[[:space:]]*(\$IncludeConfig[[:space:]]+|include\([[:space:]]*file[[:space:]]*=[[:space:]]*"?)/etc/rsyslog\.d/' "$main_conf"; then
+        main_backup="${main_conf}.bak.ccdc.$(date +%Y%m%d-%H%M%S).$$"
+        cp -p -- "$main_conf" "$main_backup" || return 1
+        printf '\n# CCDC: load rsyslog drop-ins\ninclude(file="/etc/rsyslog.d/*.conf" mode="optional")\n' >> "$main_conf" || {
+            cp -p -- "$main_backup" "$main_conf" || true
+            return 1
+        }
+        say "INFO | Enabled rsyslog.d include; main config backup: $main_backup"
     fi
-    # Do not remove someone else's UDP 9997 configuration.
-    if [[ -e "$legacy" ]] &&
-       ! grep -Fqx 'input(type="imudp" port="9997" ruleset="ccdc_udp9997")' "$legacy"; then
-        warn 'Old UDP 9997 file exists but does not match our managed CCDC stanza; inspect manually.'
-        return 1
-    fi
-    ccdc_rsyslog_preflight || return 1
     install -d -m 0750 -o syslog -g adm "$CCDC_SYSLOG_DIR" || return 1
     if [[ ! -e "$CCDC_SYSLOG_LOG" ]]; then
         install -m 0640 -o syslog -g adm /dev/null "$CCDC_SYSLOG_LOG" || return 1
     elif [[ ! -f "$CCDC_SYSLOG_LOG" ]]; then
-        warn 'Palo Alto log path is not a regular file.'; return 1
+        warn 'Palo Alto log destination is not a regular file.'
+        return 1
     fi
     if [[ -f "$CCDC_SYSLOG_CONF" ]]; then
-        was_present=1
         backup="${CCDC_SYSLOG_CONF}.bak.$(date +%Y%m%d-%H%M%S).$$"
         cp -p -- "$CCDC_SYSLOG_CONF" "$backup" || return 1
     fi
-    # Retire only the EXACT old CCDC UDP 9997 input (old logs remain intact).
-    # Move it outside the *.conf include and keep a rollback copy.
+    # Remove only the earlier CCDC-managed UDP 9997 drop-in, not third-party inputs.
     if [[ -f "$legacy" ]]; then
-        legacy_backup="${legacy}.disabled.ccdc.$(date +%Y%m%d-%H%M%S).$$"
-        mv -- "$legacy" "$legacy_backup" || return 1
-        say "INFO | Retired old UDP 9997 rsyslog drop-in: $legacy_backup"
+        if ! grep -Fqx 'input(type="imudp" port="9997" ruleset="ccdc_udp9997")' "$legacy"; then
+            warn "Old UDP 9997 file exists but is not our managed stanza: $legacy"
+            return 1
+        fi
+        old_legacy="${legacy}.disabled.$(date +%Y%m%d-%H%M%S).$$"
+        mv -- "$legacy" "$old_legacy" || return 1
+        say "INFO | Disabled managed UDP 9997 rsyslog config: $old_legacy"
     fi
-    temp="$(mktemp /etc/rsyslog.d/.ccdc-paloalto-udp514.XXXXXXXX)" || {
-        [[ -z "$legacy_backup" ]] || mv -- "$legacy_backup" "$legacy"
-        return 1
-    }
-    cat > "$temp" <<'EOF_CCDC_PALOALTO'
-# CCDC Palo Alto raw syslog only, independent of local system logging.
+    temp="$(mktemp /etc/rsyslog.d/.ccdc-paloalto.XXXXXXXX)" || return 1
+    cat > "$temp" <<'EOF_CCDC_PA'
+# CCDC Palo Alto: UDP 514 -> local file -> Splunk monitor (no UF needed).
 module(load="imudp")
 ruleset(name="ccdc_paloalto_udp514") {
     action(type="omfile" file="/var/log/paloalto/pan.log"
@@ -278,46 +201,56 @@ ruleset(name="ccdc_paloalto_udp514") {
     stop
 }
 input(type="imudp" port="514" ruleset="ccdc_paloalto_udp514")
-EOF_CCDC_PALOALTO
-    chmod 0644 "$temp"
-    if ! mv -f -- "$temp" "$CCDC_SYSLOG_CONF"; then
-        [[ -z "$legacy_backup" ]] || mv -- "$legacy_backup" "$legacy"
+EOF_CCDC_PA
+    chmod 0644 "$temp" && mv -f -- "$temp" "$CCDC_SYSLOG_CONF" || return 1
+    if ! rsyslogd -N1 -f "$main_conf"; then
+        warn 'rsyslog config validation FAILED; restoring prior configuration.'
+        ccdc_rsyslog_failure_diagnostics
+        if [[ -n "$backup" ]]; then cp -p -- "$backup" "$CCDC_SYSLOG_CONF"; else rm -f -- "$CCDC_SYSLOG_CONF"; fi
+        if [[ -n "$old_legacy" ]]; then mv -- "$old_legacy" "$legacy"; fi
+        if [[ -n "$main_backup" ]]; then cp -p -- "$main_backup" "$main_conf"; fi
         return 1
     fi
-    # On failure restore the previously-working configuration and service.
-    if ! rsyslogd -N1 -f /etc/rsyslog.conf ||
-       ! systemctl enable rsyslog.service ||
-       ! systemctl restart rsyslog.service; then
-        warn 'Palo Alto rsyslog validation/start failed; restoring prior listener config.'
+    if ! systemctl enable rsyslog.service || ! systemctl restart rsyslog.service; then
+        warn 'rsyslog did not restart; showing diagnostics. Configuration retained for troubleshooting.'
         ccdc_rsyslog_failure_diagnostics
-        if ((was_present)); then cp -p -- "$backup" "$CCDC_SYSLOG_CONF"; else rm -f -- "$CCDC_SYSLOG_CONF"; fi
-        [[ -z "$legacy_backup" ]] || mv -- "$legacy_backup" "$legacy"
-        systemctl restart rsyslog.service || true
         return 1
     fi
     for attempt in 1 2 3 4 5; do
         if systemctl is-active --quiet rsyslog.service && ccdc_pa_udp514_listening; then break; fi
         sleep 1
     done
-    if ! systemctl is-active --quiet rsyslog.service || ! ccdc_pa_udp514_listening; then
-        warn 'rsyslog active/UDP 514 listener verification failed; restoring prior config.'
+    if ! ccdc_pa_udp514_listening; then
+        warn 'UDP 514 NOT LISTENING despite valid config; leaving config in place for diagnosis.'
         ccdc_rsyslog_failure_diagnostics
-        if ((was_present)); then cp -p -- "$backup" "$CCDC_SYSLOG_CONF"; else rm -f -- "$CCDC_SYSLOG_CONF"; fi
-        [[ -z "$legacy_backup" ]] || mv -- "$legacy_backup" "$legacy"
-        systemctl restart rsyslog.service || true
         return 1
     fi
-    # Retire only the old CCDC-specific rotate policy. Retain historical log data.
-    if [[ -f "$rotate_old" ]] && grep -Fq '/var/log/remote-syslog/udp9997.log' "$rotate_old"; then
-        install -d -m 0700 -o root -g root "$rotate_backups" || return 1
-        mv -- "$rotate_old" "$rotate_backups/ccdc-remote-syslog.disabled.$(date +%Y%m%d-%H%M%S).$$" ||
-            warn 'Could not retire old UDP 9997 logrotate config; inspect manually.'
+    # ACLs let Splunk read protected rsyslog output without making it world-readable.
+    # Install after the listener is up so apt failure cannot prevent UDP reception.
+    if ! command -v setfacl >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends acl ||
+            warn 'acl installation failed: verify the Splunk OS account can read pan.log.'
+    fi
+    # Prove local UDP reception, not just the existence of a listening socket.
+    if command -v logger >/dev/null 2>&1; then
+        local probe="CCDC_PA_514_SMOKE_$$_$(date +%s)" matched=0
+        if logger --udp --server 127.0.0.1 --port 514 --tag CCDC_PA_TEST "$probe"; then
+            for attempt in 1 2 3 4 5; do
+                if grep -Fq "$probe" "$CCDC_SYSLOG_LOG"; then matched=1; break; fi
+                sleep 1
+            done
+        fi
+        if ((matched)); then
+            say 'PASS | Local UDP 514 syslog message written to /var/log/paloalto/pan.log'
+        else
+            warn 'Local UDP 514 smoke test FAILED; inspect rsyslog routing and file permissions.'
+            return 1
+        fi
+    else
+        warn 'logger not installed; UDP 514 file write not smoke-tested.'
     fi
     if command -v logrotate >/dev/null 2>&1; then
-        if [[ -f "$rotate_new" ]]; then
-            install -d -m 0700 -o root -g root "$rotate_backups" || return 1
-            cp -p -- "$rotate_new" "$rotate_backups/ccdc-paloalto-syslog.bak.$(date +%Y%m%d-%H%M%S).$$" || return 1
-        fi
+        [[ ! -f "$rotate_new" ]] || cp -p -- "$rotate_new" "${rotate_new}.bak.$(date +%Y%m%d-%H%M%S).$$"
         cat > "$rotate_new" <<'EOF_CCDC_PA_ROTATE'
 /var/log/paloalto/pan.log {
     daily
@@ -333,10 +266,10 @@ EOF_CCDC_PALOALTO
 }
 EOF_CCDC_PA_ROTATE
     else
-        warn 'logrotate unavailable; arrange log rotation for sustained PA syslog.'
+        warn 'logrotate is not installed; configure retention before receiving sustained traffic.'
     fi
-    say 'PASS | Palo Alto rsyslog UDP 514 listener active; log file created.'
-    say 'REVIEW | Actual Palo Alto sender, upstream routing/firewall, and Splunk indexing need live tests.'
+    say 'PASS | rsyslog is actively listening on UDP 514; log target /var/log/paloalto/pan.log'
+    say 'REVIEW | Verify packets from Palo Alto and indexing in Splunk.'
 }
 
 ccdc_configure_receiver() {
@@ -575,34 +508,37 @@ ccdc_expire_selected_admins() {
 # other authorized users, while root and sysadmin are denied by sshd.
 # Preserve scored Splunk Web (8000), API (8089), and UF receiver (9997).
 # Always run this function from NETLAB VM CONSOLE, never over SSH.
-# If the optional full UFW reset was declined, add only the PA syslog rules.
+# Always allow requested syslog UDP 514 AFTER any UFW reset. The rule MUST NOT
+# depend on rsyslog installation, config validation or an earlier yes/no prompt.
 ccdc_pa_syslog_ufw_reconcile() {
-    ccdc_pa_syslog_configured || { say 'SKIP | PA UDP 514 not configured; UFW unchanged'; return 0; }
     if ! command -v ufw >/dev/null 2>&1; then
-        warn 'UFW is not installed: check the actual upstream firewall.'
-        return 0
+        warn 'UFW is not installed: UDP 514 cannot be opened by UFW.'
+        return 1
     fi
     local current pa_source
     current="$(LC_ALL=C ufw status 2>&1 || true)"
     if ! grep -Eq '^Status: active$' <<< "$current"; then
-        say 'SKIP | UFW inactive; no UFW rules to change'
-        return 0
+        warn 'UFW is inactive: no active host firewall rule to add. Do NOT enable it blindly over SSH.'
+        return 1
     fi
-    # Remove only the prior broad UDP 9997 allowance; preserve Splunk TCP 9997.
+    # Remove the old unneeded broad syslog allowance; preserve Splunk TCP 9997.
     if grep -Eq '^9997/udp[[:space:]]+ALLOW IN[[:space:]]+Anywhere([[:space:]]|$)' <<< "$current"; then
-        if ! ufw --force delete allow 9997/udp; then
-            warn 'Could not remove previous broad UDP 9997 allow rule'
-            return 1
-        fi
-        say 'PASS | Removed previous broad UDP 9997 rule; TCP 9997 retained'
+        ufw --force delete allow 9997/udp || warn 'Old 9997/udp rule could not be removed'
     fi
-    for pa_source in "${CCDC_PA_SYSLOG_SOURCES[@]}"; do
-        if ! ufw allow proto udp from "$pa_source" to any port 514 comment 'CCDC Palo Alto syslog'; then
-            warn "Unable to allow Palo Alto syslog UDP 514 from $pa_source"
-            return 1
-        fi
-    done
-    say 'PASS | PA UDP 514 UFW rules added without resetting other firewall rules'
+    if (( ${#CCDC_PA_SYSLOG_SOURCES[@]} == 0 )); then
+        ufw allow 514/udp comment 'CCDC Palo Alto syslog' || return 1
+    else
+        for pa_source in "${CCDC_PA_SYSLOG_SOURCES[@]}"; do
+            ufw allow proto udp from "$pa_source" to any port 514 comment 'CCDC Palo Alto syslog' || return 1
+        done
+    fi
+    say '=== Actual UFW UDP 514 rules ==='
+    ufw status verbose | grep -E '(^Status:|514/udp|9997)' || true
+    if ! LC_ALL=C ufw status | grep -Eq '^514/udp[[:space:]]+ALLOW IN'; then
+        warn 'FAIL: UFW reports no UDP 514 inbound ALLOW rule.'
+        return 1
+    fi
+    say 'PASS | UFW allows incoming UDP 514 independently of rsyslog state.'
 }
 
 ccdc_configure_firewall() {
@@ -611,13 +547,13 @@ ccdc_configure_firewall() {
     say '=== Optional CCDC UFW host firewall ==='
     say 'New inbound connections: DENY by default.'
     say 'Inbound TCP: 22/SSH, 8000/Web, 8089/management, 9997/forwarders.'
-    say 'If PA syslog is configured: allow UDP 514 from the approved Palo Alto source IPs.'
+    say 'Inbound UDP: 514/Palo Alto syslog (source IPs configurable).'
     say 'Outbound connections: ALLOW by default (required for packages, DNS, clocks and other dependencies).'
     say 'Standard UFW ICMP handling is retained; verify CCDC ping scoring afterward.'
     say 'This changes ONLY the Debian VM firewall, not the Palo Alto firewall.'
     say 'NOTE: Palo Alto/VyOS/upstream ACLs and PA syslog profile must permit UDP 514.'
     say 'WARNING: Replacing existing UFW user rules could interrupt additional scored services.'
-    if ! yesno 'Reset UFW rules to listed inbound TCP allowances (plus restricted PA UDP 514 if configured) and ENABLE default-deny'; then
+    if ! yesno 'Reset UFW rules to listed inbound TCP allowances AND UDP 514 and ENABLE default-deny'; then
         say 'SKIP | UFW rules unchanged by operator choice.'
         return 0
     fi
@@ -659,27 +595,13 @@ ccdc_configure_firewall() {
         warn 'Failed while staging UFW rules; check status BEFORE enabling.'
         return 1
     fi
-    # Add syslog only when the PA receiver is configured; do not re-add UDP 9997.
-    if ccdc_pa_syslog_configured; then
+    # Stage UDP 514 unconditionally, after UFW reset. No rsyslog checks.
+    if (( ${#CCDC_PA_SYSLOG_SOURCES[@]} == 0 )); then
+        ufw allow 514/udp comment 'CCDC Palo Alto syslog' || return 1
+    else
         local pa_source
         for pa_source in "${CCDC_PA_SYSLOG_SOURCES[@]}"; do
-            if ! python3 - "$pa_source" <<'PY_PA_ADDR'
-import ipaddress,sys
-try:
-    addr=ipaddress.IPv4Address(sys.argv[1])
-except ValueError:
-    raise SystemExit(1)
-if addr.is_unspecified or addr.is_multicast or addr.is_loopback:
-    raise SystemExit(1)
-PY_PA_ADDR
-            then
-                warn "Invalid Palo Alto syslog source: $pa_source"
-                return 1
-            fi
-            if ! ufw allow proto udp from "$pa_source" to any port 514 comment 'CCDC Palo Alto syslog'; then
-                warn "Failed staging UDP 514 for Palo Alto source $pa_source"
-                return 1
-            fi
+            ufw allow proto udp from "$pa_source" to any port 514 comment 'CCDC Palo Alto syslog' || return 1
         done
     fi
 
@@ -697,7 +619,7 @@ PY_PA_ADDR
         return 1
     fi
     CCDC_UFW_APPLIED=1
-    say 'PASS | UFW active: required TCP allowances and restricted Palo Alto UDP 514 rule staged.'
+    say 'PASS | UFW active: required TCP allowances and Palo Alto UDP 514 staged.'
     say 'Verify remote scoring, forwarding and ping from other CCDC machines.'
 }
 
@@ -1357,19 +1279,17 @@ ccdc_verification() {
                 say "PASS | UFW inbound TCP $p allowed"
             else say "FAIL | UFW inbound TCP $p missing"; failed=1; fi
         done
-        # No UDP 9997 exception is allowed; only the specified PA sources for UDP 514.
-        local allowed_syslog_udp=0 pa_source
-        if ccdc_pa_syslog_configured; then allowed_syslog_udp=1; fi
-        if awk -v allow_udp="$allowed_syslog_udp" -v source_list="${CCDC_PA_SYSLOG_SOURCES[*]}" '
-          BEGIN {n=split(source_list,a," "); for(i=1;i<=n;i++) sources[a[i]]=1}
+        if grep -Eq '^514/udp[[:space:]]+ALLOW IN' <<< "$ufw_status"; then
+            say 'PASS | UFW inbound UDP 514 allowed'
+        else say 'FAIL | UFW inbound UDP 514 missing';failed=1; fi
+        if awk '
           $2 == "ALLOW" && $3 == "IN" &&
           $1 !~ /^(22|8000|8089|9997)\/tcp$/ &&
-          !(allow_udp == 1 && $1 == "514/udp" && sources[$4]) {found=1}
+          $1 != "514/udp" && $1 != "514/udp (v6)" {found=1}
           END {exit !found}
         ' <<< "$ufw_status"; then
-            say 'FAIL | UFW has unexpected inbound ALLOW rule (including possible old UDP 9997)'
-            failed=1
-        else say 'PASS | UFW has no unexpected inbound ALLOW rules (UDP 9997 not allowed)'; fi
+            say 'REVIEW | UFW has additional inbound ALLOW rules outside CCDC baseline'
+        else say 'PASS | UFW baseline has no unexpected inbound ALLOW rules'; fi
     else say 'FAIL | UFW not installed'; failed=1; fi
 
     if [[ "$CCDC_IPV6_UFW_SET" -eq 1 ]]; then
@@ -1403,19 +1323,8 @@ ccdc_verification() {
            ! grep -Fq '[monitor:///var/log/remote-syslog/udp9997.log]' "$pa_input"; then
             say 'PASS | Splunk pan:log input configured for index=main (ingestion not yet proven)'
         else say 'FAIL | Splunk Palo Alto file input missing or old UDP 9997 input remains';failed=1; fi
-        if command -v ufw >/dev/null 2>&1 &&
-           LC_ALL=C ufw status 2>/dev/null | grep -Eq '^Status: active$'; then
-            local pa_source pa_missing=0
-            for pa_source in "${CCDC_PA_SYSLOG_SOURCES[@]}"; do
-                if awk -v src="$pa_source" '$1=="514/udp" && $2=="ALLOW" && $3=="IN" && $4==src {found=1} END{exit !found}' <<< "$ufw_status"; then
-                    say "PASS | UFW allows UDP 514 from Palo Alto source $pa_source"
-                else
-                    say "FAIL | UFW UDP 514 rule missing for $pa_source";failed=1;pa_missing=1
-                fi
-            done
-        else
-            say 'SKIP | UFW inactive/unavailable; remote UDP 514 firewall reachability unconfirmed'
-        fi
+        # The UFW 514 rule is checked in the firewall section above.
+        say 'REVIEW | UFW rule alone does not prove Palo Alto delivery.'
         say 'REVIEW | Send a harmless test from PA and verify index=main sourcetype=pan:log'
     elif [[ "$CCDC_SYSLOG_REQUESTED" -eq 1 ]]; then
         say 'FAIL | Palo Alto UDP 514 receiver requested but not configured';failed=1
@@ -1610,8 +1519,14 @@ case "${1:-}" in
     --paloalto-syslog-only)
         [[ $EUID -eq 0 ]] || { say 'Run --paloalto-syslog-only as root'; exit 1; }
         CCDC_SYSLOG_REQUESTED=1
-        ccdc_setup_pa_syslog_udp514 || { say 'FAIL | Palo Alto UDP 514 listener setup failed'; exit 1; }
-        ccdc_pa_syslog_ufw_reconcile || { say 'FAIL | PA syslog UFW setup failed'; exit 1; }
+        # Attempt both independent steps so failure in one cannot hide the other.
+        local_syslog_failure=0
+        ccdc_pa_syslog_ufw_reconcile || { say 'FAIL | Palo Alto UDP 514 UFW setup failed'; local_syslog_failure=1; }
+        ccdc_setup_pa_syslog_udp514 || { say 'FAIL | Palo Alto UDP 514 listener setup failed'; local_syslog_failure=1; }
+        if ((local_syslog_failure)); then
+            say 'FAIL | Syslog-only setup incomplete; check errors above.'
+            exit 1
+        fi
         ccdc_setup_monitoring_input || { say 'FAIL | Splunk PA log input setup failed'; exit 1; }
         if yesno 'Restart Splunk to activate Palo Alto file monitoring? (temporarily interrupts scored services)'; then
             if ! "$SPLUNK_BIN" restart || ! "$SPLUNK_BIN" status; then
@@ -1743,19 +1658,17 @@ ccdc_configure_receiver || fail 'Splunk receiver setup failed'
 ccdc_configure_lockout || fail 'Splunk lockout setup failed'
 ccdc_apply_ssh_restriction || fail 'SSH restriction failed'
 ccdc_block_ssh_elevation || fail 'SSH sudo/su elevation restriction failed'
-# Configure UDP listener before UFW is reset so the associated rule is retained.
-# If skipped on a later run, a preexisting CCDC listener still receives its rule.
-if yesno 'Install/enable rsyslog receiver for Palo Alto syslog on UDP 514?'; then
-    CCDC_SYSLOG_REQUESTED=1
-    if ccdc_setup_pa_syslog_udp514; then
-        CCDC_SYSLOG_STATUS=PASS
-    else
-        CCDC_SYSLOG_STATUS=FAIL
-        fail 'Palo Alto UDP 514 rsyslog receiver setup failed'
-    fi
-fi
+# Open UDP 514 AFTER the optional UFW reset, independent of rsyslog success.
 ccdc_configure_firewall || fail 'UFW configuration failed'
-ccdc_pa_syslog_ufw_reconcile || fail 'Palo Alto syslog UFW rules failed'
+ccdc_pa_syslog_ufw_reconcile || fail 'Palo Alto UDP 514 UFW rule missing'
+# Palo Alto receiver is required, not optional: configure it on every full run.
+CCDC_SYSLOG_REQUESTED=1
+if ccdc_setup_pa_syslog_udp514; then
+    CCDC_SYSLOG_STATUS=PASS
+else
+    CCDC_SYSLOG_STATUS=FAIL
+    fail 'Palo Alto UDP 514 rsyslog listener setup failed'
+fi
 ccdc_optional_ufw_ipv6_block || fail 'Optional UFW IPv6 change failed'
 
 # Pre-configure Splunk monitoring inputs before restarting, even if optional
