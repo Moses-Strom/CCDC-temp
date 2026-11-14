@@ -136,151 +136,114 @@ ccdc_rsyslog_failure_diagnostics() {
 }
 
 ccdc_setup_pa_syslog_udp514() {
-    say '=== Configure rsyslog Palo Alto UDP 514 listener ==='
-    local main_conf='/etc/rsyslog.conf' legacy='/etc/rsyslog.d/25-ccdc-udp9997.conf'
-    local rotate_new='/etc/logrotate.d/ccdc-paloalto-syslog'
-    local backup='' main_backup='' temp='' old_legacy='' attempt
-    local log_owner='root' log_group='root' service_user=''
+    say '=== Configure Palo Alto syslog on UDP 514 ==='
+    local conf=/etc/rsyslog.conf legacy=/etc/rsyslog.d/25-ccdc-udp9997.conf
+    local group=root owner='' temp='' attempt probe
 
+    # Debian 12 rsyslog is already installed in this lab; only install if absent.
     if ! command -v rsyslogd >/dev/null 2>&1; then
-        say 'Installing rsyslog ...'
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rsyslog || return 1
     fi
-    if [[ ! -f "$main_conf" || -L "$main_conf" || ! -r "$main_conf" ||
-          -L /etc/rsyslog.d || ( -e /etc/rsyslog.d && ! -d /etc/rsyslog.d ) ]]; then
-        warn 'Unexpected /etc/rsyslog.conf or /etc/rsyslog.d; refusing unsafe modification.'
-        return 1
+    if [[ ! -f "$conf" || -L "$conf" || ! -r "$conf" ]]; then
+        warn 'Main /etc/rsyslog.conf is missing or unsafe.'; return 1
     fi
-    install -d -m 0755 -o root -g root /etc/rsyslog.d || return 1
-    # Debian rsyslog does not universally use a 'syslog' OS account. systemd
-    # units without User= run as root; honor an explicitly configured User=.
-    service_user="$(systemctl show -p User --value rsyslog.service 2>/dev/null || true)"
-    if [[ -n "$service_user" ]]; then
-        if ! getent passwd "$service_user" >/dev/null; then
-            warn "rsyslog.service User=$service_user is not a valid account."
-            return 1
-        fi
-        log_owner="$service_user"
+    if [[ -L /etc/rsyslog.d || -L "$CCDC_SYSLOG_CONF" ||
+          -L "$CCDC_SYSLOG_DIR" || -L "$CCDC_SYSLOG_LOG" ]]; then
+        warn 'A managed rsyslog path is a symlink; refusing to overwrite.'; return 1
     fi
-    if getent group adm >/dev/null; then log_group='adm'; fi
-    say "INFO | Using $log_owner:$log_group ownership for the Palo Alto log."
-    if [[ -L "$CCDC_SYSLOG_CONF" || -L "$CCDC_SYSLOG_DIR" || -L "$CCDC_SYSLOG_LOG" || -L "$legacy" ]]; then
-        warn 'Symlink detected in managed syslog paths; not modifying it.'
-        return 1
+    install -d -m 0755 /etc/rsyslog.d || return 1
+    # Ensure Debian loads our drop-in, not just the main file.
+    if ! grep -Eq '^[[:space:]]*(\$IncludeConfig[[:space:]]+|include\([[:space:]]*file[[:space:]]*=[[:space:]]*"?)/etc/rsyslog\.d/' "$conf"; then
+        cp -p -- "$conf" "${conf}.bak.ccdc.$(date +%Y%m%d-%H%M%S).$$" || return 1
+        printf '
+include(file="/etc/rsyslog.d/*.conf" mode="optional")
+' >> "$conf" || return 1
     fi
-    # Ensure rsyslog actually loads drop-ins. Without an include, rsyslog can be
-    # active with no UDP socket even though the new .conf is perfectly valid.
-    if ! grep -Eq '^[[:space:]]*(\$IncludeConfig[[:space:]]+|include\([[:space:]]*file[[:space:]]*=[[:space:]]*"?)/etc/rsyslog\.d/' "$main_conf"; then
-        main_backup="${main_conf}.bak.ccdc.$(date +%Y%m%d-%H%M%S).$$"
-        cp -p -- "$main_conf" "$main_backup" || return 1
-        printf '\n# CCDC: load rsyslog drop-ins\ninclude(file="/etc/rsyslog.d/*.conf" mode="optional")\n' >> "$main_conf" || {
-            cp -p -- "$main_backup" "$main_conf" || true
-            return 1
-        }
-        say "INFO | Enabled rsyslog.d include; main config backup: $main_backup"
+
+    # rsyslog runs as root on the observed Debian VM. Make the log readable
+    # through Splunk's primary OS group (without syslog:adm or extra ACLs).
+    owner="$(ps -eo user=,comm= | awk '$2=="splunkd" {print $1;exit}' || true)"
+    if [[ -z "$owner" || "$owner" == UNKNOWN ]] && id splunk >/dev/null 2>&1; then owner=splunk; fi
+    if [[ -n "$owner" ]] && id "$owner" >/dev/null 2>&1; then
+        group="$(id -gn "$owner")" || return 1
+    else
+        warn 'Splunk OS user not detected: verify its read access after setup.'
     fi
-    install -d -m 0750 -o "$log_owner" -g "$log_group" "$CCDC_SYSLOG_DIR" || return 1
+    install -d -m 0750 -o root -g "$group" "$CCDC_SYSLOG_DIR" || return 1
     if [[ ! -e "$CCDC_SYSLOG_LOG" ]]; then
-        install -m 0640 -o "$log_owner" -g "$log_group" /dev/null "$CCDC_SYSLOG_LOG" || return 1
+        install -m 0640 -o root -g "$group" /dev/null "$CCDC_SYSLOG_LOG" || return 1
     elif [[ ! -f "$CCDC_SYSLOG_LOG" ]]; then
-        warn 'Palo Alto log destination is not a regular file.'
-        return 1
+        warn 'pan.log is not a regular file.'; return 1
     fi
-    chown -- "$log_owner:$log_group" "$CCDC_SYSLOG_LOG" || return 1
-    chmod 0640 "$CCDC_SYSLOG_LOG" || return 1
+    chown root:"$group" "$CCDC_SYSLOG_LOG" && chmod 0640 "$CCDC_SYSLOG_LOG" || return 1
+
+    # Remove ONLY the old CCDC-managed UDP 9997 receiver (never TCP 9997).
+    if [[ -f "$legacy" && ! -L "$legacy" ]] &&
+       grep -Fqx 'input(type="imudp" port="9997" ruleset="ccdc_udp9997")' "$legacy"; then
+        mv -- "$legacy" "${legacy}.disabled.$(date +%Y%m%d-%H%M%S).$$" || return 1
+    fi
     if [[ -f "$CCDC_SYSLOG_CONF" ]]; then
-        backup="${CCDC_SYSLOG_CONF}.bak.$(date +%Y%m%d-%H%M%S).$$"
-        cp -p -- "$CCDC_SYSLOG_CONF" "$backup" || return 1
+        cp -p -- "$CCDC_SYSLOG_CONF" "${CCDC_SYSLOG_CONF}.bak.$(date +%Y%m%d-%H%M%S).$$" || return 1
     fi
-    # Remove only the earlier CCDC-managed UDP 9997 drop-in, not third-party inputs.
-    if [[ -f "$legacy" ]]; then
-        if ! grep -Fqx 'input(type="imudp" port="9997" ruleset="ccdc_udp9997")' "$legacy"; then
-            warn "Old UDP 9997 file exists but is not our managed stanza: $legacy"
-            return 1
-        fi
-        old_legacy="${legacy}.disabled.$(date +%Y%m%d-%H%M%S).$$"
-        mv -- "$legacy" "$old_legacy" || return 1
-        say "INFO | Disabled managed UDP 9997 rsyslog config: $old_legacy"
-    fi
-    temp="$(mktemp /etc/rsyslog.d/.ccdc-paloalto.XXXXXXXX)" || return 1
+    temp="$(mktemp /etc/rsyslog.d/.ccdc-pa-XXXXXXXX)" || return 1
     cat > "$temp" <<EOF_CCDC_PA
-# CCDC Palo Alto: UDP 514 -> local file -> Splunk monitor (no UF needed).
+# Palo Alto syslog UDP 514 -> /var/log/paloalto/pan.log -> Splunk
 module(load="imudp")
 ruleset(name="ccdc_paloalto_udp514") {
     action(type="omfile" file="/var/log/paloalto/pan.log"
-           fileOwner="$log_owner" fileGroup="$log_group" fileCreateMode="0640")
+           fileOwner="root" fileGroup="$group" fileCreateMode="0640")
     stop
 }
 input(type="imudp" port="514" ruleset="ccdc_paloalto_udp514")
 EOF_CCDC_PA
     chmod 0644 "$temp" && mv -f -- "$temp" "$CCDC_SYSLOG_CONF" || return 1
-    if ! rsyslogd -N1 -f "$main_conf"; then
-        warn 'rsyslog config validation FAILED; restoring prior configuration.'
-        ccdc_rsyslog_failure_diagnostics
-        if [[ -n "$backup" ]]; then cp -p -- "$backup" "$CCDC_SYSLOG_CONF"; else rm -f -- "$CCDC_SYSLOG_CONF"; fi
-        if [[ -n "$old_legacy" ]]; then mv -- "$old_legacy" "$legacy"; fi
-        if [[ -n "$main_backup" ]]; then cp -p -- "$main_backup" "$main_conf"; fi
-        return 1
+    if ! rsyslogd -N1 -f "$conf"; then
+        warn 'rsyslog validation failed; drop-in retained for troubleshooting.'; return 1
     fi
     if ! systemctl enable rsyslog.service || ! systemctl restart rsyslog.service; then
-        warn 'rsyslog did not restart; showing diagnostics. Configuration retained for troubleshooting.'
-        ccdc_rsyslog_failure_diagnostics
-        return 1
+        warn 'rsyslog restart failed; inspect journalctl -u rsyslog -n 40.'
+        ccdc_rsyslog_failure_diagnostics; return 1
     fi
     for attempt in 1 2 3 4 5; do
-        if systemctl is-active --quiet rsyslog.service && ccdc_pa_udp514_listening; then break; fi
+        ccdc_pa_udp514_listening && break
         sleep 1
     done
     if ! ccdc_pa_udp514_listening; then
-        warn 'UDP 514 NOT LISTENING despite valid config; leaving config in place for diagnosis.'
-        ccdc_rsyslog_failure_diagnostics
-        return 1
+        warn 'rsyslog started but UDP 514 is NOT LISTENING.'
+        ccdc_rsyslog_failure_diagnostics; return 1
     fi
-    # ACLs let Splunk read protected rsyslog output without making it world-readable.
-    # Install after the listener is up so apt failure cannot prevent UDP reception.
-    if ! command -v setfacl >/dev/null 2>&1; then
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends acl ||
-            warn 'acl installation failed: verify the Splunk OS account can read pan.log.'
-    fi
-    # Prove local UDP reception, not just the existence of a listening socket.
+    say 'PASS | rsyslog UDP 514 is listening'
     if command -v logger >/dev/null 2>&1; then
-        local probe="CCDC_PA_514_SMOKE_$$_$(date +%s)" matched=0
-        if logger --udp --server 127.0.0.1 --port 514 --tag CCDC_PA_TEST "$probe"; then
-            for attempt in 1 2 3 4 5; do
-                if grep -Fq "$probe" "$CCDC_SYSLOG_LOG"; then matched=1; break; fi
-                sleep 1
-            done
+        probe="CCDC_PA_514_SMOKE_$$_$(date +%s)"
+        logger --udp --server 127.0.0.1 --port 514 --tag CCDC_PA_TEST "$probe" || return 1
+        for attempt in 1 2 3 4 5; do
+            grep -Fq "$probe" "$CCDC_SYSLOG_LOG" && break
+            sleep 1
+        done
+        if ! grep -Fq "$probe" "$CCDC_SYSLOG_LOG"; then
+            warn 'UDP 514 listening, but test message did not reach pan.log.'; return 1
         fi
-        if ((matched)); then
-            say 'PASS | Local UDP 514 syslog message written to /var/log/paloalto/pan.log'
-        else
-            warn 'Local UDP 514 smoke test FAILED; inspect rsyslog routing and file permissions.'
-            return 1
-        fi
-    else
-        warn 'logger not installed; UDP 514 file write not smoke-tested.'
+        say 'PASS | UDP 514 message received in pan.log'
     fi
     if command -v logrotate >/dev/null 2>&1; then
-        [[ ! -f "$rotate_new" ]] || cp -p -- "$rotate_new" "${rotate_new}.bak.$(date +%Y%m%d-%H%M%S).$$"
-        cat > "$rotate_new" <<EOF_CCDC_PA_ROTATE
+        cat > /etc/logrotate.d/ccdc-paloalto-syslog <<EOF_CCDC_ROTATE
 /var/log/paloalto/pan.log {
     daily
     rotate 7
     compress
     missingok
     notifempty
-    create 0640 $log_owner $log_group
+    create 0640 root $group
     sharedscripts
     postrotate
         /bin/systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || true
     endscript
 }
-EOF_CCDC_PA_ROTATE
+EOF_CCDC_ROTATE
     else
-        warn 'logrotate is not installed; configure retention before receiving sustained traffic.'
+        warn 'logrotate not installed; configure retention before sustained use.'
     fi
-    say 'PASS | rsyslog is actively listening on UDP 514; log target /var/log/paloalto/pan.log'
-    say 'REVIEW | Verify packets from Palo Alto and indexing in Splunk.'
+    say 'PASS | Palo Alto UDP 514 configured; Splunk monitors index=main sourcetype=pan:log'
 }
 
 ccdc_configure_receiver() {
