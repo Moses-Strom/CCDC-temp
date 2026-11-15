@@ -10,7 +10,8 @@
 
 ## 1. Goals and environment
 
-The Debian 12 Splunk Enterprise VM is the central security-monitoring node for an authorized Collegiate Cyber Defense Competition environment. The competition topology includes a Palo Alto firewall, VyOS router, Windows Active Directory and SQL servers, Linux application/email servers, and Windows/Linux workstations. The intended competition Splunk address is `172.20.240.20` **only when confirmed in the active pod**.
+The Debian 12 Splunk Enterprise VM is the central security-monitoring node for an authorized Collegiate Cyber Defense Competition environment.
+The intended competition Splunk address is `172.20.240.20` **only when confirmed in the active pod**.
 
 The solution is intended to:
 
